@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="canvas-token" content="__CANVAS_TOKEN__">
+  <title>AKS Troubleshooting | Pixel Robots</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <div><p class="eyebrow">PIXEL ROBOTS / AKS</p><h1>Troubleshooting canvas<span class="dot">.</span></h1><p class="subtitle">From cluster signals to confident next steps.</p></div>
+    <span id="mode" class="badge">READ ONLY</span>
+  </header>
+  <main>
+    <div id="status" role="status" aria-live="polite"></div>
+    <section class="panel">
+      <div class="section-title"><div><p class="eyebrow">01 / CONNECT</p><h2>Choose your target</h2></div><button id="refresh-contexts" class="secondary">Refresh contexts</button></div>
+      <p class="hint">Uses your existing kubeconfig and permissions. Selecting a context does not change your active kubectl context.</p>
+      <div class="controls"><label>Cluster context<select id="context"><option value="">Select a context</option></select></label><label>Namespace<select id="namespace" disabled><option value="">Select a namespace</option></select></label><button id="refresh" disabled>Refresh data</button></div>
+    </section>
+    <div class="grid">
+      <section class="panel"><div class="section-title"><div><p class="eyebrow">02 / EXPLORE</p><h2>Workloads</h2></div></div><p class="hint">Select a pod for its latest 200 log lines. Deployments can be scaled in edit mode.</p><div id="workloads" class="list empty">Choose a namespace to see workloads.</div></section>
+      <section class="panel"><div class="section-title"><div><p class="eyebrow">03 / SIGNALS</p><h2>Recent events</h2></div></div><div id="events" class="list empty">Choose a namespace to see events.</div></section>
+    </div>
+    <section class="panel"><div class="section-title"><div><p class="eyebrow">04 / EVIDENCE</p><h2>Pod logs</h2></div><label class="inline"><input type="checkbox" id="previous"> Previous container</label></div><p id="log-target" class="hint">Select a pod above. Logs can contain sensitive data.</p><pre id="logs">No logs loaded.</pre></section>
+    <div class="grid">
+      <section class="panel"><p class="eyebrow">05 / INVESTIGATE</p><h2>Findings</h2><p class="hint">Add evidence yourself or ask Copilot to add a finding. Nothing is saved until you choose Save.</p><ul id="findings"></ul><label for="finding">Finding</label><textarea id="finding" rows="3" maxlength="2000" placeholder="What did you observe? Include the evidence."></textarea><div class="actions"><button id="add-finding">Add finding</button><button id="save" class="secondary">Save privately</button><button id="history" class="secondary">View saved investigations</button></div><div id="history-list"></div></section>
+      <section class="panel"><p class="eyebrow">06 / GO FURTHER</p><h2>Monitoring &amp; tools</h2><p class="hint">Open your existing Azure monitoring and Grafana resources. History and trends depend on your configured data sources, permissions and retention.</p><div class="links"><a href="https://portal.azure.com/#browse/Microsoft.ContainerService%2FmanagedClusters" target="_blank" rel="noopener noreferrer">Azure portal: AKS clusters ↗</a><a href="https://learn.microsoft.com/azure/azure-monitor/containers/container-insights-overview" target="_blank" rel="noopener noreferrer">Container Insights ↗</a><a href="https://learn.microsoft.com/azure/azure-monitor/essentials/prometheus-metrics-overview" target="_blank" rel="noopener noreferrer">Managed Prometheus ↗</a><a href="https://learn.microsoft.com/azure/managed-grafana/" target="_blank" rel="noopener noreferrer">Azure Managed Grafana ↗</a></div><label for="grafana">Your Grafana dashboard URL</label><input id="grafana" type="url" placeholder="https://your-grafana.example/dashboard"><p class="hint">URLs are not saved. Do not include credentials or tokens.</p><a id="grafana-link" target="_blank" rel="noopener noreferrer" hidden>Open Grafana dashboard ↗</a><p class="hint">Direct metrics queries and charts are not yet implemented.</p></section>
+    </div>
+    <section class="panel danger"><div class="section-title"><div><p class="eyebrow">OPTIONAL / CHANGE CONTROL</p><h2>Editing mode</h2><p class="hint">Off by default and reset when the target changes. Scaling requires a separate confirmation; Kubernetes RBAC still applies. GitOps may revert manual changes.</p></div><button id="toggle-edit" class="secondary">Enable editing</button></div></section>
+  </main>
+  <footer>Built by <a href="https://pixelrobots.co.uk" target="_blank" rel="noopener noreferrer">Pixel Robots</a> · Evidence first. Changes deliberately.</footer>
+</body>
+</html>

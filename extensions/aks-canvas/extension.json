@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "initialization": "module",
+  "canvases": [
+    {
+      "id": "pixelrobots-aks-troubleshooting",
+      "displayName": "AKS Troubleshooting",
+      "description": "Investigate AKS workloads with a read-only-by-default Kubernetes canvas.",
+      "actions": [
+        {
+          "name": "get_context",
+          "description": "Get the selected Kubernetes context, namespace, and investigation notes."
+        },
+        {
+          "name": "add_finding",
+          "description": "Add an evidence-backed finding to the current investigation without saving it to disk.",
+          "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text"],
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
