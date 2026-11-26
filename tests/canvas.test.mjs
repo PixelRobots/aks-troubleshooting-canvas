@@ -3,7 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { createKubernetes } from '../extensions/aks-canvas/kubernetes.mjs';
 import { createInstance } from '../extensions/aks-canvas/server.mjs';
-import { detectIssues } from '../extensions/aks-canvas/issues.mjs';
+import { detectIssues, detectWarningIssues } from '../extensions/aks-canvas/issues.mjs';
+import { groupFindings } from '../extensions/aks-canvas/finding-groups.mjs';
 import { checkDeallocatedNodes, describeAzureFailure } from '../extensions/aks-canvas/azure.mjs';
 
 test('canvas manifest exposes single and batch issue publishing', async () => {
@@ -27,6 +28,135 @@ test('issue checks report current signals with evidence without treating normal 
   assert.match(issues[1].evidence, /rollout may be in progress/);
   assert.equal(issues[2].kind, 'Node');
   assert.ok(issues.every(issue => issue.evidence && issue.next && issue.docs.length));
+});
+
+test('recent warning checks retain distinct reasons and match current resource identities', () => {
+  const now = Date.parse('2026-11-26T14:00:00Z');
+  const pod = { kind: 'Pod', name: 'pod-a', namespace: 'shop', uid: 'pod-uid',
+    owners: [{ kind: 'DaemonSet', name: 'agent', uid: 'owner-uid' }] };
+  const event = (reason, time, target = pod) => ({ reason, time, target, message: 'private event message' });
+  const result = detectWarningIssues([
+    event('FailedMount', '2026-11-26T13:00:00Z'),
+    event('FailedMount', '2026-11-26T13:30:00Z'),
+    event('FailedScheduling', '2026-11-26T13:45:00Z'),
+    event('Unhealthy', '2026-11-26T13:50:00Z', { kind: 'DaemonSet', name: 'agent', namespace: 'shop', uid: 'owner-uid' }),
+    event('BackOff', '2026-11-26T12:59:59Z'),
+    event('BackOff', '2026-11-26T14:00:01Z'),
+    event('BackOff', 'invalid'),
+    event('FailedMount', '2026-11-26T13:30:00Z', { ...pod, uid: 'old-uid' }),
+    event('FailedMount', '2026-11-26T13:30:00Z', { ...pod, namespace: 'other' }),
+    event('private-reason', '2026-11-26T13:30:00Z')
+  ], [pod], [], now);
+  assert.deepEqual(result.issues.map(issue => issue.title), [
+    'Pod pod-a: recent FailedMount warning',
+    'Pod pod-a: recent FailedScheduling warning',
+    'DaemonSet agent: recent Unhealthy warning'
+  ]);
+  assert.match(result.errors[0], /2 matching events.*invalid or future timestamps/);
+  assert.doesNotMatch(JSON.stringify(result), /private/);
+  assert.deepEqual(groupFindings(result.issues, [], [pod]).map(group => group.target.kind), ['DaemonSet']);
+  const ownerEvent = event('Unhealthy', '2026-11-26T13:50:00Z',
+    { kind: 'DaemonSet', name: 'agent', namespace: 'shop', uid: 'owner-uid' });
+  const oldPod = { ...pod, name: 'pod-old', uid: 'other-pod', owners: [{ kind: 'DaemonSet', name: 'agent', uid: 'old-owner' }] };
+  const ambiguous = detectWarningIssues([ownerEvent], [pod, oldPod], [], now);
+  assert.equal(ambiguous.issues.length, 0);
+  assert.match(ambiguous.errors[0], /ambiguous resource identities/);
+  const verified = detectWarningIssues([ownerEvent], [pod, oldPod,
+    { kind: 'DaemonSet', name: 'agent', namespace: 'shop', uid: 'owner-uid' }], [], now);
+  assert.equal(verified.issues.length, 1);
+});
+
+test('warning-event pages are bounded, context-pinned and exclude raw event messages', async () => {
+  const requests = [];
+  const kube = createKubernetes(async args => {
+    requests.push(args);
+    const url = new URL(args.at(-1), 'https://kubernetes.invalid');
+    assert.equal(url.pathname, '/api/v1/events');
+    assert.equal(url.searchParams.get('fieldSelector'), 'type=Warning');
+    assert.equal(url.searchParams.get('limit'), '200');
+    return JSON.stringify({
+      kind: 'EventList',
+      metadata: { continue: requests.length === 1 ? 'next+page' : '' },
+      items: [{
+        type: 'Warning', reason: 'FailedMount', message: 'private-event-message',
+        lastTimestamp: '2026-11-26T13:00:00Z',
+        involvedObject: { kind: 'Pod', name: 'pod-a', namespace: 'shop', uid: 'pod-uid' }
+      }]
+    });
+  });
+  const result = await kube.clusterWarningEvents('ctx');
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0].slice(0, 3), ['--context', 'ctx', 'get']);
+  assert.equal(new URL(requests[1].at(-1), 'https://kubernetes.invalid').searchParams.get('continue'), 'next+page');
+  assert.equal(result.truncated, false);
+  assert.equal(result.events.length, 2);
+  assert.doesNotMatch(JSON.stringify(result), /private/);
+
+  let page = 0;
+  const bounded = createKubernetes(async () => JSON.stringify({
+    kind: 'EventList', items: [], metadata: { continue: `page-${++page}` }
+  }));
+  assert.equal((await bounded.clusterWarningEvents('ctx')).truncated, true);
+  assert.equal(page, 10);
+  const repeated = createKubernetes(async () => JSON.stringify({
+    kind: 'EventList', items: [], metadata: { continue: 'same' }
+  }));
+  await assert.rejects(repeated.clusterWarningEvents('ctx'), /repeated event continuation token/);
+  let attempts = 0;
+  const failed = createKubernetes(async () => {
+    if (++attempts === 2) throw new Error('Forbidden');
+    return JSON.stringify({ kind: 'EventList', items: [], metadata: { continue: 'next' } });
+  });
+  await assert.rejects(failed.clusterWarningEvents('ctx'), /Forbidden/);
+  const unknownLastTime = createKubernetes(async () => JSON.stringify({
+    kind: 'EventList',
+    items: [{ type: 'Warning', reason: 'FailedMount', count: 2, firstTimestamp: '2026-11-26T13:00:00Z' }]
+  }));
+  assert.equal((await unknownLastTime.clusterWarningEvents('ctx')).events[0].time, undefined);
+});
+
+test('cluster and Copilot findings merge under Deployment and CronJob owners', () => {
+  const resources = [
+    { kind: 'Pod', name: 'web-abc', namespace: 'shop', owners: [{ kind: 'ReplicaSet', name: 'web-rs' }] },
+    { kind: 'ReplicaSet', name: 'web-rs', namespace: 'shop', owners: [{ kind: 'Deployment', name: 'web' }] },
+    { kind: 'Pod', name: 'backup-123', namespace: 'shop', owners: [{ kind: 'Job', name: 'backup-123' }], references: [{ kind: 'PersistentVolumeClaim', name: 'backup-data' }] },
+    { kind: 'Job', name: 'backup-123', namespace: 'shop', owners: [{ kind: 'CronJob', name: 'backup' }] },
+  ];
+  const cluster = [
+    { kind: 'Pod', name: 'web-abc', namespace: 'shop', title: 'Pod web-abc: Pending', evidence: 'Pod is pending', next: 'Review scheduling', docs: [] },
+    { kind: 'Pod', name: 'backup-123', namespace: 'shop', title: 'Pod backup-123: Pending', evidence: 'Pod is pending', next: 'Review scheduling', docs: [] }
+  ];
+  const copilot = [
+    { kind: 'Pod', name: 'web-abc', namespace: 'shop', title: 'Pod web-abc: Pending', evidence: 'No assigned node is reported', next: 'Check the owner workload', docs: [] },
+    { kind: 'PersistentVolumeClaim', name: 'backup-data', namespace: 'shop', title: 'PVC backup-data: unavailable', evidence: 'Copilot observed a related claim signal', next: 'Inspect the claim state', docs: [] }
+  ];
+  const groups = groupFindings(cluster, copilot, resources);
+  assert.deepEqual(groups.map(group => [group.target.kind, group.target.name]), [
+    ['Deployment', 'web'], ['CronJob', 'backup']
+  ]);
+  const deployment = groups.find(group => group.target.kind === 'Deployment');
+  assert.equal(deployment.signals.length, 1);
+  assert.deepEqual(deployment.signals[0].sources, ['Cluster check', 'Copilot']);
+  const cronjob = groups.find(group => group.target.kind === 'CronJob');
+  assert.equal(cronjob.resources.size, 2);
+  assert.equal(cronjob.signals.length, 2);
+
+  const sharedClaim = groupFindings([{
+    kind: 'PersistentVolumeClaim', name: 'shared-data', namespace: 'shop',
+    title: 'PVC shared-data: unavailable', evidence: 'Claim signal', next: 'Review claim', docs: []
+  }], [], [
+    { kind: 'Pod', name: 'web-abc', namespace: 'shop', owners: [{ kind: 'Deployment', name: 'web' }], references: [{ kind: 'PersistentVolumeClaim', name: 'shared-data' }] },
+    { kind: 'Pod', name: 'api-abc', namespace: 'shop', owners: [{ kind: 'Deployment', name: 'api' }], references: [{ kind: 'PersistentVolumeClaim', name: 'shared-data' }] }
+  ]);
+  assert.deepEqual(sharedClaim[0].target, { kind: 'PersistentVolumeClaim', name: 'shared-data', namespace: 'shop' });
+
+  const customOwner = groupFindings([{
+    kind: 'Pod', name: 'operator-pod', namespace: 'shop',
+    title: 'Pod operator-pod: Pending', evidence: 'Pod is pending', next: 'Review scheduling', docs: []
+  }], [], [{
+    kind: 'Pod', name: 'operator-pod', namespace: 'shop', owners: [{ kind: 'CustomWorkload', name: 'workload' }]
+  }]);
+  assert.deepEqual(customOwner[0].target, { kind: 'Pod', name: 'operator-pod', namespace: 'shop' });
 });
 
 test('kubectl commands pin the target and reject invalid mutation inputs', async () => {
@@ -62,6 +192,58 @@ test('cluster pod scanning handles Kubernetes lists without per-item kind metada
   assert.equal(detectIssues(pods, [])[0].namespace, 'shop');
 });
 
+test('cluster pod scanning detects current OOM termination without treating recovered pods as failed', async () => {
+  const kube = createKubernetes(async () => JSON.stringify({
+    kind: 'PodList',
+    items: [
+      { metadata: { name: 'oom', namespace: 'shop' }, status: { phase: 'Failed',
+        containerStatuses: [{ state: { terminated: { reason: 'OOMKilled' } } }] } },
+      { metadata: { name: 'recovered', namespace: 'shop' }, status: { phase: 'Running',
+        containerStatuses: [{ state: { running: {} }, lastState: { terminated: { reason: 'OOMKilled' } } }] } }
+    ]
+  }));
+  const issues = detectIssues(await kube.clusterPods('ctx'), []);
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].title, 'Pod oom: OOMKilled');
+  assert.match(issues[0].evidence, /container terminated: OOMKilled/);
+});
+
+test('cluster ownership scans project pod references, ReplicaSets and Jobs', async () => {
+  const kube = createKubernetes(async args => {
+    const path = new URL(args.at(-1), 'https://kubernetes.invalid').pathname;
+    if (path === '/api/v1/pods') return JSON.stringify({
+      kind: 'PodList',
+      items: [{
+        metadata: { name: 'backup-123', namespace: 'shop', ownerReferences: [{ kind: 'Job', name: 'backup-123', controller: true }] },
+        spec: { volumes: [
+          { persistentVolumeClaim: { claimName: 'backup-data' } },
+          { csi: { driver: 'secrets-store.csi.k8s.io', volumeAttributes: { secretProviderClass: 'vault' } } }
+        ] },
+        status: { phase: 'Pending' }
+      }]
+    });
+    if (path === '/apis/apps/v1/replicasets') return JSON.stringify({
+      kind: 'ReplicaSetList',
+      items: [{ metadata: { name: 'web-rs', namespace: 'shop', ownerReferences: [{ kind: 'Deployment', name: 'web', controller: true }] } }]
+    });
+    if (path === '/apis/batch/v1/jobs') return JSON.stringify({
+      kind: 'JobList',
+      items: [{ metadata: { name: 'backup-123', namespace: 'shop', ownerReferences: [{ kind: 'CronJob', name: 'backup', controller: true }] } }]
+    });
+    assert.fail(`Unexpected Kubernetes path: ${path}`);
+  });
+  const pods = await kube.clusterPods('ctx');
+  const replicaSets = await kube.clusterReplicaSets('ctx');
+  const jobs = await kube.clusterJobs('ctx');
+  assert.deepEqual(pods[0].owners, [{ kind: 'Job', name: 'backup-123' }]);
+  assert.deepEqual(pods[0].references, [
+    { kind: 'PersistentVolumeClaim', name: 'backup-data' },
+    { kind: 'SecretProviderClass', name: 'vault' }
+  ]);
+  assert.deepEqual(replicaSets[0].owners, [{ kind: 'Deployment', name: 'web' }]);
+  assert.deepEqual(jobs[0].owners, [{ kind: 'CronJob', name: 'backup' }]);
+});
+
 test('admin-named contexts can scan workloads and events without changing context', async t => {
   const context = 'cluster-admin';
   const calls = [];
@@ -75,7 +257,10 @@ test('admin-named contexts can scan workloads and events without changing contex
       const path = new URL(args.at(-1), 'https://kubernetes.invalid').pathname;
       if (path === '/api/v1/pods') return JSON.stringify({ kind: 'PodList', items: [pod] });
       if (path === '/apis/apps/v1/deployments') return JSON.stringify({ kind: 'DeploymentList', items: [deployment] });
+      if (path === '/apis/apps/v1/replicasets') return JSON.stringify({ kind: 'ReplicaSetList', items: [] });
+      if (path === '/apis/batch/v1/jobs') return JSON.stringify({ kind: 'JobList', items: [] });
       if (path === '/api/v1/nodes') return JSON.stringify({ kind: 'NodeList', items: [] });
+      if (path === '/api/v1/events') return JSON.stringify({ kind: 'EventList', items: [] });
     }
     if (args.includes('namespaces')) return JSON.stringify({ items: [{ metadata: { name: 'shop' } }] });
     if (args.includes('deployments,pods')) return JSON.stringify({ items: [pod, deployment] });
@@ -85,6 +270,9 @@ test('admin-named contexts can scan workloads and events without changing contex
   const instance = await createInstance({ kubernetes, checkNodes: async nodes => ({ nodes, errors: [] }) });
   t.after(() => instance.close());
   const page = await (await fetch(instance.url)).text();
+  const moduleResponse = await fetch(new URL('finding-groups.mjs', instance.url));
+  assert.equal(moduleResponse.status, 200);
+  assert.match(await moduleResponse.text(), /export function groupFindings/);
   const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
   const request = async (path, data = {}) => {
     const response = await fetch(new URL(`api/${path}`, instance.url), {
@@ -117,23 +305,51 @@ test('resource investigation projects pending evidence and safe related referenc
         nodeName: 'node-a', containers: [{ env: [{ value: 'do-not-return' }] }],
         volumes: [{ persistentVolumeClaim: { claimName: 'data' } }, { csi: { driver: 'secrets-store.csi.k8s.io', volumeAttributes: { secretProviderClass: 'vault' } } }]
       },
-      status: { phase: 'Pending', conditions: [{ type: 'PodScheduled', status: 'False', reason: 'Unschedulable', message: 'Insufficient cpu' }] }
+      status: {
+        phase: 'Pending', conditions: [{ type: 'PodScheduled', status: 'False', reason: 'Unschedulable', message: 'Insufficient cpu' }],
+        containerStatuses: [{ name: 'app', state: { terminated: { reason: 'Error', exitCode: 1 } }, lastState: { terminated: { reason: 'OOMKilled', exitCode: 137, message: 'private-termination' } } }]
+      }
     });
   });
   const target = { kind: 'Pod', name: 'pod-a', namespace: 'shop' };
   const details = await kube.resource('ctx', target);
   assert.equal(details.conditions[0].reason, 'Unschedulable');
+  assert.equal(details.containers[0].terminationExitCode, 1);
+  assert.equal(details.containers[0].lastTerminationReason, 'OOMKilled');
+  assert.equal(details.containers[0].lastTerminationExitCode, 137);
   assert.deepEqual(details.related, [
     { kind: 'Job', name: 'backup' }, { kind: 'Node', name: 'node-a' },
     { kind: 'PersistentVolumeClaim', name: 'data' }, { kind: 'SecretProviderClass', name: 'vault' }
   ]);
-  assert.doesNotMatch(JSON.stringify(details), /do-not-return/);
+  assert.doesNotMatch(JSON.stringify(details), /do-not-return|private-termination/);
   const events = await kube.resourceEvents('ctx', target, details.uid);
   assert.equal(events[0].reason, 'FailedMount');
   assert.ok(calls[1].includes('involvedObject.uid=uid-123'));
   await assert.rejects(kube.resource('ctx', { ...target, kind: 'Secret' }), /Unsupported resource kind/);
   await assert.rejects(kube.resource('ctx', { ...target, name: '--all' }), /Invalid resource name/);
   assert.equal(calls.length, 2);
+});
+
+test('CronJob investigation projects only reported scheduling status', async () => {
+  let item = {
+    metadata: { name: 'backup', uid: 'uid-123' },
+    spec: { schedule: '0 1 * * *', suspend: false, jobTemplate: { spec: { template: { spec: { secret: 'do-not-return' } } } } },
+    status: { active: [{ name: 'a' }, { name: 'b' }], lastScheduleTime: '2026-01-02T01:00:00Z', lastSuccessfulTime: '2026-01-01T01:00:00Z' }
+  };
+  const kube = createKubernetes(async () => JSON.stringify(item));
+  const target = { kind: 'CronJob', name: 'backup', namespace: 'shop' };
+  const details = await kube.resource('ctx', target);
+  assert.equal(details.schedule, '0 1 * * *');
+  assert.equal(details.suspended, false);
+  assert.equal(details.activeJobs, 2);
+  assert.equal(details.lastScheduleTime, '2026-01-02T01:00:00Z');
+  assert.equal(details.lastSuccessfulTime, '2026-01-01T01:00:00Z');
+  assert.doesNotMatch(JSON.stringify(details), /do-not-return/);
+  item = { metadata: { name: 'backup' }, spec: {}, status: {} };
+  const missing = await kube.resource('ctx', target);
+  assert.equal(missing.activeJobs, undefined);
+  assert.equal(missing.suspended, undefined);
+  assert.equal(missing.lastSuccessfulTime, undefined);
 });
 
 test('cluster pod scanning follows encoded continuation tokens without buffering the entire list', async () => {
@@ -285,6 +501,7 @@ test('cluster scan reports partial failures and rejects stale or unsafe AI issue
     contexts: async () => ['ctx'],
     clusterPods: async () => [{ kind: 'Pod', name: 'pod-a', namespace: 'shop', status: 'Pending' }],
     clusterDeployments: async () => [],
+    clusterWarningEvents: async () => ({ events: [], truncated: false }),
     nodes: async () => { throw new Error('Forbidden'); }
   };
   const instance = await createInstance({ kubernetes });
@@ -316,6 +533,41 @@ test('cluster scan reports partial failures and rejects stale or unsafe AI issue
   assert.deepEqual(instance.publishIssues([node, { ...issue, title: 'Second finding' }]), { published: 2 });
   assert.equal(instance.getContext().aiIssues[2].namespace, '');
   assert.throws(() => instance.publishIssues([]), /between 1 and 100/);
+});
+
+test('cluster scan incorporates recent warning signals and reports incomplete event reads', async t => {
+  const pod = { kind: 'Pod', name: 'pod-a', namespace: 'shop', uid: 'pod-uid', status: 'Running',
+    owners: [{ kind: 'DaemonSet', name: 'agent', uid: 'agent-uid' }] };
+  let failEvents = false;
+  const kubernetes = {
+    contexts: async () => ['ctx'],
+    clusterPods: async () => [pod],
+    clusterDeployments: async () => [],
+    nodes: async () => [],
+    clusterWarningEvents: async () => {
+      if (failEvents) throw new Error('Forbidden');
+      return { truncated: true, events: [
+        { reason: 'FailedMount', time: new Date().toISOString(), target: pod, message: 'private-event-message' }
+      ] };
+    }
+  };
+  const instance = await createInstance({ kubernetes, checkNodes: async nodes => ({ nodes, errors: [] }) });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = async (path, data = {}) => (await fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  })).json();
+  await request('select-context', { context: 'ctx' });
+  const scan = await request('scan');
+  assert.equal(scan.issues[0].title, 'Pod pod-a: recent FailedMount warning');
+  assert.match(scan.errors[0], /2,000 events.*incomplete/);
+  assert.equal(groupFindings(scan.issues, [], scan.resources)[0].target.kind, 'DaemonSet');
+  assert.doesNotMatch(JSON.stringify(scan), /private-event-message/);
+  failEvents = true;
+  const failed = await request('scan');
+  assert.deepEqual(failed.issues, []);
+  assert.match(failed.errors[0], /Warning events: Forbidden/);
 });
 
 test('cluster-scoped nodes can be inspected without selecting a namespace', async t => {
@@ -350,6 +602,7 @@ test('scan retains unknown nodes and reports Azure verification failures', async
     contexts: async () => ['ctx'],
     clusterPods: async () => [],
     clusterDeployments: async () => [],
+    clusterWarningEvents: async () => ({ events: [], truncated: false }),
     nodes: async () => [node]
   };
   const instance = await createInstance({
@@ -392,7 +645,7 @@ test('manual Copilot questions require the selected context and resource target'
   const sent = [];
   const instance = await createInstance({
     kubernetes: { contexts: async () => ['ctx-a', 'ctx-b'], namespaces: async () => ['shop'] },
-    askManualCopilot: async (...args) => sent.push(args)
+    askManualCopilot: async (...args) => { sent.push(args); return 'Answer to the resource question'; }
   });
   t.after(() => instance.close());
   const page = await (await fetch(instance.url)).text();
@@ -412,8 +665,112 @@ test('manual Copilot questions require the selected context and resource target'
   assert.equal((await request('ask-manual-copilot', resource)).status, 200);
   assert.deepEqual(sent, [
     ['ctx-a', null, 'Check cluster'],
-    ['ctx-a', { kind: 'Pod', name: 'pod-a', namespace: 'shop' }, 'Why pending?']
+    ['ctx-a', { kind: 'Pod', name: 'pod-a', namespace: 'shop' }, 'Why pending?', [
+      'Resource evidence was not available; do not assume the resource is healthy.',
+      'Related pod 1 status or events could not be read; evidence is incomplete.'
+    ]]
   ]);
+});
+
+test('focused investigations sample related pods locally and retain the complete response', async t => {
+  const calls = [];
+  const prompts = [];
+  const pods = ['a', 'b', 'c', 'd'].map(name => ({
+    kind: 'Pod', name, namespace: 'shop', status: 'Pending', owners: [{ kind: 'Job', name: 'job' }]
+  }));
+  const kubernetes = {
+    contexts: async () => ['ctx'], namespaces: async () => ['shop'],
+    clusterPods: async () => [...pods, { kind: 'Pod', name: 'unrelated', namespace: 'shop', status: 'Pending', owners: [] }],
+    clusterDeployments: async () => [], clusterReplicaSets: async () => [],
+    clusterWarningEvents: async () => ({ events: [], truncated: false }),
+    clusterJobs: async () => [{ kind: 'Job', name: 'job', namespace: 'shop', owners: [{ kind: 'CronJob', name: 'backup' }] }],
+    nodes: async () => [],
+    resource: async (_context, target) => ({
+      ...target, uid: 'uid-123', phase: target.kind === 'Pod' ? 'Pending' : undefined,
+      conditions: [], containers: [{ restarts: 1 }], related: []
+    }),
+    resourceEvents: async () => [{ type: 'Warning', reason: 'FailedScheduling', message: 'private-event-value' }],
+    logs: async (_context, _namespace, pod, previous) => {
+      calls.push([pod, previous]);
+      if (previous) throw new Error('private-error-value');
+      return 'connection refused private-log-value';
+    }
+  };
+  const instance = await createInstance({
+    kubernetes, checkNodes: async nodes => ({ nodes, errors: [] }),
+    askResourceCopilot: async (_context, _target, signals) => { prompts.push(signals); return 'Complete answer\nwith the actual checks.'; }
+  });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = (path, data = {}) => fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  });
+  await request('select-context', { context: 'ctx' });
+  await request('scan');
+  await request('select-namespace', { namespace: 'shop' });
+  const target = { context: 'ctx', namespace: 'shop', kind: 'CronJob', name: 'backup' };
+  await request('resource', target);
+  const response = await request('ask-resource-copilot', target);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).summary, 'Complete answer\nwith the actual checks.');
+  assert.equal(calls.length, 6);
+  assert.ok(calls.every(([name]) => ['a', 'b', 'c'].includes(name)));
+  assert.match(prompts[0].join(' '), /Only 3 of 4 related pods/);
+  assert.match(prompts[0].join(' '), /FailedScheduling.*connection refused.*previous logs could not be read/);
+  assert.doesNotMatch(JSON.stringify(prompts), /private/);
+  const state = await (await request('state')).json();
+  assert.equal(state.resourceSummaries[0].summary, 'Complete answer\nwith the actual checks.');
+});
+
+test('focused investigation does not save a response after the selected namespace changes', async t => {
+  let release;
+  let started;
+  const waiting = new Promise(resolve => { release = resolve; });
+  const began = new Promise(resolve => { started = resolve; });
+  const instance = await createInstance({
+    kubernetes: {
+      contexts: async () => ['ctx'], namespaces: async () => ['shop', 'other'],
+      resource: async (_context, target) => ({ ...target, uid: 'uid-123', conditions: [], containers: [], related: [] }),
+      resourceEvents: async () => []
+    },
+    askResourceCopilot: async () => { started(); await waiting; return 'Old summary'; }
+  });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = (path, data = {}) => fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  });
+  await request('select-context', { context: 'ctx' });
+  await request('select-namespace', { namespace: 'shop' });
+  const target = { context: 'ctx', namespace: 'shop', kind: 'Deployment', name: 'web' };
+  await request('resource', target);
+  const pending = request('ask-resource-copilot', target);
+  await began;
+  await request('select-namespace', { namespace: 'other' });
+  release();
+  assert.equal((await pending).status, 400);
+  assert.deepEqual((await (await request('state')).json()).resourceSummaries, []);
+});
+
+test('focused investigation reports a missing Copilot response', async t => {
+  const instance = await createInstance({
+    kubernetes: { contexts: async () => ['ctx'], namespaces: async () => ['shop'] },
+    askResourceCopilot: async () => undefined
+  });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = (path, data = {}) => fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  });
+  await request('select-context', { context: 'ctx' });
+  await request('select-namespace', { namespace: 'shop' });
+  const response = await request('ask-resource-copilot', { context: 'ctx', namespace: 'shop', kind: 'Deployment', name: 'web' });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /did not return a summary/);
+  assert.deepEqual((await (await request('state')).json()).resourceSummaries, []);
 });
 
 test('resource evidence is target-bound and event failures remain visible', async t => {
@@ -425,7 +782,7 @@ test('resource evidence is target-bound and event failures remain visible', asyn
     resourceEvents: async () => { throw new Error('Forbidden'); }
   };
   const instance = await createInstance({
-    kubernetes, askResourceCopilot: async (context, target, signals) => requested.push({ context, target, signals })
+    kubernetes, askResourceCopilot: async (context, target, signals) => { requested.push({ context, target, signals }); return 'Investigation summary'; }
   });
   t.after(() => instance.close());
   const page = await (await fetch(instance.url)).text();
@@ -442,7 +799,7 @@ test('resource evidence is target-bound and event failures remain visible', asyn
   assert.equal((await request('ask-resource-copilot', target)).status, 200);
   assert.deepEqual(requested, [{
     context: 'ctx', target: { kind: 'Pod', name: 'pod-a', namespace: 'shop' },
-    signals: ['Resource events could not be read; event evidence is incomplete.']
+    signals: ['Resource events could not be read; event evidence is incomplete.', 'Pod 1 logs were unavailable; log evidence is incomplete.']
   }]);
   assert.equal((await request('resource', { ...target, namespace: 'other' })).status, 400);
   assert.equal((await request('ask-resource-copilot', { ...target, kind: 'Secret' })).status, 400);
@@ -456,16 +813,18 @@ test('resource investigation shares only allowlisted indicators and clears them 
     resource: async (_context, target) => ({
       ...target, uid: 'uid-123', phase: 'Pending', desired: 3, available: 1,
       conditions: [{ type: 'PodScheduled', status: 'False', reason: 'Unschedulable', message: 'private-condition' }],
-      containers: [{ waitingReason: 'ContainerCreating', waitingMessage: 'private-container' }],
-      related: [{ kind: 'SecretProviderClass', name: 'private-reference' }]
+      containers: [{ waitingReason: 'ContainerCreating', waitingMessage: 'private-container', terminationExitCode: 1, lastTerminationReason: 'OOMKilled', lastTerminationExitCode: 137 }],
+      related: [{ kind: 'SecretProviderClass', name: 'private-reference' }],
+      suspended: false, activeJobs: 2, lastScheduleTime: '2026-11-26T13:00:00Z', lastSuccessfulTime: 'private-date'
     }),
     resourceEvents: async () => [
-      { reason: 'FailedMount', message: 'SecretNotFound private-event' },
-      { reason: 'private-reason', message: 'private-message' }
+      { type: 'Warning', reason: 'FailedMount', time: '2026-11-26T13:42:16Z', message: 'SecretNotFound private-event' },
+      { type: 'Normal', reason: 'Unhealthy', message: 'private-normal-event' },
+      { type: 'Warning', reason: 'private-reason', message: 'private-message' }
     ]
   };
   const instance = await createInstance({
-    kubernetes, askResourceCopilot: async (_context, _target, signals) => requested.push(signals)
+    kubernetes, askResourceCopilot: async (_context, _target, signals) => { requested.push(signals); return 'Investigation summary'; }
   });
   t.after(() => instance.close());
   const page = await (await fetch(instance.url)).text();
@@ -479,6 +838,10 @@ test('resource investigation shares only allowlisted indicators and clears them 
   assert.equal((await request('resource', target)).status, 200);
   assert.equal((await request('ask-resource-copilot', { ...target, signals: ['private-client-input'] })).status, 200);
   assert.match(requested[0].join(' '), /Pending.*Unschedulable.*ContainerCreating.*FailedMount.*SecretNotFound/);
+  assert.match(requested[0].join(' '), /OOMKilled.*exit code 137/);
+  assert.match(requested[0].join(' '), /currently reports termination exit code 1/);
+  assert.match(requested[0].join(' '), /FailedMount event reports a last-observed time of 2026-11-26T13:42:16\.000Z/);
+  assert.doesNotMatch(JSON.stringify(requested[0]), /Unhealthy/);
   assert.doesNotMatch(JSON.stringify(requested[0]), /private/);
   await request('select-namespace', { namespace: 'other' });
   await request('select-namespace', { namespace: 'shop' });
@@ -488,6 +851,73 @@ test('resource investigation shares only allowlisted indicators and clears them 
   await request('resource', deployment);
   await request('ask-resource-copilot', deployment);
   assert.match(requested[2].join(' '), /fewer available replicas than desired/);
+  assert.match(requested[2].join(' '), /1 available replicas and 3 desired replicas/);
+  const cronjob = { ...target, kind: 'CronJob', name: 'backup' };
+  await request('resource', cronjob);
+  await request('ask-resource-copilot', cronjob);
+  assert.match(requested[3].join(' '), /schedule is not suspended.*2 active jobs.*last scheduled time as 2026-11-26T13:00:00\.000Z/);
+  assert.doesNotMatch(requested[3].join(' '), /last successful|private/);
+});
+
+test('focused evidence extracts fixed diagnostic indicators without forwarding event or log text', async t => {
+  const requested = [];
+  const kubernetes = {
+    contexts: async () => ['ctx'],
+    namespaces: async () => ['shop'],
+    resource: async (_context, target) => ({
+      ...target, uid: 'uid-123', phase: 'Pending', conditions: [],
+      containers: [{ restarts: 3 }], related: []
+    }),
+    resourceEvents: async () => [
+      { type: 'Warning', reason: 'FailedMount', time: '2026-11-26T13:42:16Z', count: 6, message: 'MountVolume.SetUp failed for private-volume: secrets-store.csi.k8s.io failed to get secret from https://private-vault.vault.azure.net/ private-secret: StatusCode=404 Code="SecretNotFound" private-token' },
+      { type: 'Warning', reason: 'FailedMount', time: '2026-11-26T12:42:16Z', count: 2, message: 'secrets-store.csi.k8s.io https://private-vault.vault.azure.net/ private-secret StatusCode=404 SecretNotFound' },
+      { type: 'Warning', reason: 'FailedScheduling', message: '0/3 nodes are available: 2 Insufficient cpu, 1 Insufficient memory, 1 node(s) had untolerated taint private-taint.' },
+      { type: 'Warning', reason: 'Failed', message: 'Failed to pull image private-registry: authentication required' },
+      { type: 'Warning', reason: 'Unhealthy', message: 'Readiness probe failed: private-response' },
+      { type: 'Normal', reason: 'FailedMount', message: 'StatusCode=403 permission denied private-normal' },
+      { type: 'Warning', reason: 'Unknown', message: 'StatusCode=403 permission denied private-unknown' }
+    ],
+    logs: async (_context, _namespace, _pod, previous) => previous
+      ? 'authentication failed private-password'
+      : 'lookup private-host: no such host; x509: certificate signed by unknown authority; private-log'
+  };
+  const instance = await createInstance({
+    kubernetes, askResourceCopilot: async (_context, _target, signals) => { requested.push(signals); return 'Summary'; }
+  });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = (path, data) => fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  });
+  await request('select-context', { context: 'ctx' });
+  await request('select-namespace', { namespace: 'shop' });
+  const target = { context: 'ctx', namespace: 'shop', kind: 'Pod', name: 'pod-a' };
+  assert.equal((await request('resource', target)).status, 200);
+  assert.equal((await request('ask-resource-copilot', target)).status, 200);
+  const signals = requested[0].join(' ');
+  assert.match(signals, /3 restarts/);
+  assert.match(signals, /FailedMount.*SecretNotFound.*Secrets Store CSI driver.*Azure Key Vault.*HTTP status 404/);
+  assert.match(signals, /One FailedMount event contains these fixed matches together:.*SecretNotFound.*HTTP status 404\. Its reported last-observed time is 2026-11-26T13:42:16\.000Z\. It reports 6 occurrences/);
+  assert.equal(requested[0].filter(signal => signal.startsWith('One FailedMount event')).length, 1);
+  assert.doesNotMatch(signals, /2026-11-26T12:42:16/);
+  assert.match(signals, /FailedScheduling.*insufficient CPU.*insufficient memory.*untolerated taint/);
+  assert.match(signals, /Failed event.*image-pull failure.*authentication failure indication/);
+  assert.match(signals, /Unhealthy event.*readiness probe failure/);
+  assert.match(signals, /current logs.*no such host.*certificate signed by unknown authority/);
+  assert.match(signals, /previous logs.*authentication failed/);
+  assert.doesNotMatch(signals, /HTTP status 403|access-denied indication|private-/);
+
+  const fragments = ['Insufficient cpu', 'Insufficient memory', 'Insufficient ephemeral-storage', 'untolerated taint'];
+  kubernetes.resourceEvents = async () => Array.from({ length: 11 }, (_, index) => ({
+    type: 'Warning', reason: 'FailedScheduling',
+    message: fragments.filter((_, bit) => (index + 1) & (1 << bit)).join('; ') + ' private-content'
+  }));
+  await request('resource', target);
+  await request('ask-resource-copilot', target);
+  assert.equal(requested[1].filter(signal => signal.startsWith('One FailedScheduling event')).length, 10);
+  assert.match(requested[1].join(' '), /1 additional combination of event indicators was omitted/);
+  assert.doesNotMatch(requested[1].join(' '), /private-content/);
 });
 
 test('namespace selection cannot finish against a context that changed during lookup', async t => {

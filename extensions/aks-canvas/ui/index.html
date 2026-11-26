@@ -6,7 +6,7 @@
   <meta name="canvas-token" content="__CANVAS_TOKEN__">
   <title>AKS Troubleshooting | Pixel Robots</title>
   <link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script>
+  <script type="module" src="/app.js"></script>
 </head>
 <body>
   <header class="masthead">
@@ -24,7 +24,7 @@
     <section id="cluster-picker" class="panel picker">
       <div class="section-title"><div><p class="eyebrow">GET STARTED</p><h2>Choose a cluster</h2></div><button id="refresh-contexts" class="secondary">Refresh contexts</button></div>
       <p class="hint">Select a Kubernetes context from your existing kubeconfig. Your active kubectl context will not be changed.</p>
-      <p class="hint">Selecting a cluster automatically requests a read-only Copilot investigation. Authorized tools may share cluster evidence with Copilot; sensitive logs require your approval.</p>
+      <p class="hint">Selecting a cluster requests a read-only Copilot review of scan findings. Opening a resource checks logs locally; raw logs are not sent to Copilot.</p>
       <label for="context">Cluster context</label>
       <select id="context"><option value="">Select a context</option></select>
       <p class="hint">Contexts can refer to non-AKS clusters too. Your existing access and network connection are required.</p>
@@ -42,26 +42,22 @@
       </nav>
       <section id="panel-overview" class="panel cluster-scan" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
         <div class="cluster-scan-header">
-          <div><p class="eyebrow">CLUSTER INVESTIGATION</p><h2 id="overview-title">Cluster findings</h2></div>
+          <div><p class="eyebrow">CLUSTER INVESTIGATION</p><h2 id="overview-title">Findings</h2></div>
           <div class="cluster-scan-actions"><button id="scan" class="secondary" hidden>Rescan cluster</button><button id="ask-copilot" class="secondary" hidden>Investigate again</button></div>
         </div>
-        <p class="hint">Copilot reviews signals from read-only workload and node checks; further investigation may be needed to confirm a cause. Rescanning updates the checks only. Choose Investigate again to request a new Copilot review; earlier findings may remain visible.</p>
+        <p class="hint">Findings are grouped by workload where possible. Copilot reviews scan signals; causes need confirmation. Rescan updates checks; Investigate again requests a new Copilot review.</p>
         <div class="scan-progress">
-          <p role="status" class="progress-status"><span class="status-indicator"><span id="ai-spinner" class="spinner" aria-hidden="true" hidden></span></span><strong>Copilot</strong><span id="ai-status">Select a cluster to start an investigation.</span></p>
+          <p id="ai-progress" role="status" class="progress-status"><span class="status-indicator"><span id="ai-spinner" class="spinner" aria-hidden="true" hidden></span></span><strong>Copilot</strong><span id="ai-status">Select a cluster to start an investigation.</span></p>
           <p role="status" class="progress-status"><span class="status-indicator"><span id="scan-spinner" class="spinner" aria-hidden="true" hidden></span><span id="scan-result-icon" class="result-icon" aria-hidden="true" hidden></span></span><strong>Cluster checks</strong><span id="scan-status">Select a cluster to start checks.</span></p>
         </div>
-        <section id="copilot-findings" class="findings-group" aria-labelledby="copilot-findings-title" hidden>
-          <h3 id="copilot-findings-title">Copilot findings</h3>
-          <div id="ai-issues" class="issue-list"></div>
-        </section>
         <section id="cluster-findings" class="findings-group" aria-labelledby="cluster-findings-title" hidden>
           <div class="findings-header">
-            <h3 id="cluster-findings-title">Cluster checks</h3>
-            <label for="findings-filter">Filter cluster checks<input id="findings-filter" type="search" placeholder="Resource or namespace" aria-describedby="findings-filter-status"></label>
+            <h3 id="cluster-findings-title">Findings</h3>
+            <label for="findings-filter">Filter findings<input id="findings-filter" type="search" placeholder="Workload, resource or namespace" aria-describedby="findings-filter-status"></label>
           </div>
           <p id="findings-filter-status" class="hint filter-status" role="status"></p>
           <div id="issues" class="issue-list"></div>
-          <button id="show-more-issues" class="secondary" hidden>Show more signals</button>
+          <button id="show-more-issues" class="secondary" hidden>Show more findings</button>
         </section>
       </section>
       <section id="panel-workloads" class="panel" role="tabpanel" aria-labelledby="tab-workloads" tabindex="0" hidden>
@@ -76,14 +72,12 @@
         </section>
         <section class="manual-section">
         <h3>Explore workloads</h3>
-        <p class="hint">Choose a namespace and inspect a deployment or pod for evidence, related resources and logs.</p>
         <div id="namespace-controls" class="controls namespace-controls" hidden>
           <label>Namespace<select id="namespace" disabled><option value="">Select a namespace</option></select></label>
           <button id="refresh-namespaces" class="secondary">Refresh namespaces</button>
           <button id="refresh" class="secondary" disabled>Refresh data</button>
         </div>
         <h3>Choose a pod or deployment</h3>
-        <p class="hint">Filter the workloads, then select one to open its investigation.</p>
         <div class="controls">
           <label>Resource type<select id="workload-kind"><option value="">All deployments and pods</option><option value="Deployment">Deployments</option><option value="Pod">Pods</option></select></label>
           <label>Filter by name<input id="workload-filter" type="search" placeholder="Workload name"></label>
@@ -121,12 +115,15 @@
         <div class="resource-metadata">
           <div><span>Cluster</span><strong id="resource-cluster"></strong></div>
           <div><span>Namespace</span><strong id="resource-namespace"></strong></div>
-          <div><span>State</span><strong id="resource-phase">Loading…</strong></div>
+          <div><span id="resource-phase-label">State</span><strong id="resource-phase">Loading…</strong></div>
+          <div id="resource-pod-summary" hidden><span>Affected pods (scan)</span><strong id="resource-pod-phases"></strong></div>
           <div><span>Created</span><strong id="resource-created">Loading…</strong></div>
         </div>
         <section class="resource-card ai-summary">
           <p class="eyebrow">COPILOT SUMMARY</p><h3>What’s happening?</h3>
-          <p role="status" class="hint progress-status"><span id="resource-ai-spinner" class="spinner" aria-hidden="true" hidden></span><span id="resource-ai-status">Preparing a focused Copilot investigation.</span></p>
+          <p id="resource-ai-progress" role="status" class="hint progress-status"><span id="resource-ai-spinner" class="spinner" aria-hidden="true" hidden></span><span id="resource-ai-status">Preparing a focused Copilot investigation.</span></p>
+          <p id="resource-summary-age" class="summary-age hint" hidden></p>
+          <div id="resource-summary" class="resource-summary"></div>
           <div id="resource-issues" class="issue-list"></div>
           <div id="resource-manual-controls" hidden>
             <label for="resource-question">Ask Copilot about this resource</label>
@@ -134,8 +131,13 @@
             <p id="resource-question-note" class="hint">Your question is sent to Copilot. Do not include secrets or sensitive logs.</p>
             <div class="actions"><button id="ask-resource-question">Send to Copilot</button></div>
             <p id="resource-question-status" class="hint" role="status"></p>
-            <p class="hint">Refreshing reloads evidence and requests a new Copilot summary. Only limited status indicators are shared automatically; raw events and logs are not.</p>
           </div>
+        </section>
+        <section class="resource-card">
+          <h3>Cluster-check findings</h3>
+          <p class="hint">Signals from the latest scan may be out of date. Open an affected resource to inspect its current status and events.</p>
+          <p id="resource-scan-status" class="hint" role="status"></p>
+          <div id="resource-scan-issues" class="issue-list"></div>
         </section>
         <div class="detail-grid">
           <section class="resource-card">
@@ -146,7 +148,7 @@
           </section>
         </div>
         <section class="resource-card">
-          <h3>Related resources</h3><p class="hint">Explore owners, volume claims, CSI SecretProviderClass references and nodes where available. Secret values are not read.</p><div id="resource-related" class="related-list"></div>
+          <h3>Related resources</h3><p class="hint">Owners, nodes, volume claims and CSI SecretProviderClass references are shown when available. Pod references come from the scan and may be incomplete; they do not establish a cause. Secret values are not read.</p><div id="resource-related" class="related-list"></div>
           <button id="resource-scale" class="secondary" hidden>Scale deployment</button>
         </section>
         <section class="resource-card">

@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
+import { groupFindings } from '../extensions/aks-canvas/finding-groups.mjs';
 
 test('cluster picker opens the investigation and switching clusters resets editing', async () => {
   const elements = new Map();
-  function element(id = '') {
+  function element(id = '', tag = 'div') {
     if (elements.has(id)) return elements.get(id);
     const node = {
-      id, value: '', hidden: false, disabled: false, textContent: '', children: [], attributes: {},
+      id, tagName: tag.toUpperCase(), value: '', hidden: false, disabled: false, textContent: '', children: [], attributes: {},
       classList: { toggle() {}, add() {}, remove() {} },
       setAttribute(name, value) { this.attributes[name] = value; },
       focus() {},
@@ -23,7 +24,8 @@ test('cluster picker opens the investigation and switching clusters resets editi
     if (id) elements.set(id, node);
     return node;
   }
-  const backend = { context: '', namespace: '', aiIssues: [], editing: false };
+  const textOf = node => node.textContent + node.children.map(textOf).join('');
+  const backend = { context: '', namespace: '', aiIssues: [], resourceSummaries: [], editing: false };
   const investigations = [];
   const investigationRequests = [];
   const resourceInvestigations = [];
@@ -39,7 +41,15 @@ test('cluster picker opens the investigation and switching clusters resets editi
   let failInvestigation = false;
   let failScan = false;
   let failWorkloads = false;
+  let failResourceRead = false;
   let partialScan = false;
+  let groupedScan = false;
+  let groupedSetKind = '';
+  let longGroupedScan = false;
+  let resourceDelay;
+  let resourceQuestionDelay;
+  let failResource = false;
+  let customResourceSummary;
   const respond = (route, body) => {
     if (route === 'state' || route === 'select-context' || route === 'select-namespace' || route === 'editing') return { ...backend };
     if (route === 'contexts') return ['east', 'west'];
@@ -53,21 +63,74 @@ test('cluster picker opens the investigation and switching clusters resets editi
     if (route === 'ask-resource-copilot') return { sent: true };
     if (route === 'ask-manual-copilot') return { sent: true };
     if (route === 'resource') return {
-      details: { kind: body.kind, name: body.name, namespace: body.namespace, phase: 'Pending', conditions: [{ type: 'PodScheduled', status: 'False', reason: 'Unschedulable' }], containers: [], related: [{ kind: 'SecretProviderClass', name: 'vault' }] },
+      details: body.kind === 'CronJob'
+        ? { kind: body.kind, name: body.name, namespace: body.namespace, schedule: '0 1 * * *', suspended: false, activeJobs: 2, lastScheduleTime: '2026-01-02T01:00:00Z', conditions: [], containers: [], related: [] }
+        : { kind: body.kind, name: body.name, namespace: body.namespace, phase: 'Pending', conditions: [{ type: 'PodScheduled', status: 'False', reason: 'Unschedulable' }], containers: [], related: body.name === 'backup-d' || body.name === 'worker' || body.name.startsWith('worker-') || body.kind === 'SecretProviderClass' ? [] : body.name === 'backup-job-a' ? [{ kind: 'CronJob', name: 'backup' }] : body.name === 'backup-a' ? [{ kind: 'Job', name: 'backup-job-a' }, { kind: 'SecretProviderClass', name: 'vault' }] : [{ kind: 'SecretProviderClass', name: body.name === 'backup-c' ? 'other-vault' : 'vault' }] },
       events: [{ type: 'Warning', reason: 'FailedMount', message: 'Mount failed' }]
     };
-    if (route === 'scan') return { context: backend.context, issues: Array.from({ length: 130 }, (_, i) => ({
-      title: `Signal ${i}`, evidence: 'Evidence', next: 'Inspect', docs: [],
+    if (route === 'scan' && longGroupedScan) {
+      const pods = Array.from({ length: 10 }, (_, index) => ({
+        kind: 'Pod', name: `pod-${index}-${'x'.repeat(65)}`, namespace: 'shop', status: 'Pending',
+        owners: [{ kind: 'Deployment', name: 'large-group' }]
+      }));
+      return {
+        context: backend.context, errors: [], resources: pods,
+        issues: pods.map(pod => ({
+          ...pod, title: `Pod ${pod.name}: Pending`, evidence: 'Long evidence. '.repeat(12), next: 'Inspect pod.', docs: []
+        }))
+      };
+    }
+    if (route === 'scan' && groupedSetKind) return {
+      context: backend.context, errors: [],
+      resources: ['a', 'b'].map(suffix => ({
+        kind: 'Pod', name: `worker-${suffix}`, namespace: 'shop', status: 'Pending',
+        owners: [{ kind: groupedSetKind, name: 'worker' }],
+        references: [{ kind: 'SecretProviderClass', name: 'shared-vault' },
+          ...(suffix === 'b' ? [{ kind: 'PersistentVolumeClaim', name: 'data-b' }] : [])]
+      })),
+      issues: ['a', 'b'].map(suffix => ({
+        kind: 'Pod', name: `worker-${suffix}`, namespace: 'shop', title: `Pod worker-${suffix}: Pending`,
+        evidence: 'Current pod state: Pending.', next: 'Review pod events.', docs: []
+      }))
+    };
+    if (route === 'scan' && groupedScan) return {
+      context: backend.context, errors: [],
+      resources: [
+        { kind: 'Pod', name: 'backup-a', namespace: 'shop', status: 'Pending', owners: [{ kind: 'Job', name: 'backup-job-a' }], references: [{ kind: 'SecretProviderClass', name: 'vault' }, { kind: 'PersistentVolumeClaim', name: 'data' }] },
+        { kind: 'Job', name: 'backup-job-a', namespace: 'shop', owners: [{ kind: 'CronJob', name: 'backup' }] },
+        { kind: 'Pod', name: 'backup-b', namespace: 'shop', status: 'Pending', owners: [{ kind: 'Job', name: 'backup-job-b' }], references: [{ kind: 'SecretProviderClass', name: 'vault' }] },
+        { kind: 'Job', name: 'backup-job-b', namespace: 'shop', owners: [{ kind: 'CronJob', name: 'backup' }] },
+        { kind: 'Pod', name: 'backup-c', namespace: 'shop', status: 'Pending', owners: [{ kind: 'Job', name: 'backup-job-c' }], references: [{ kind: 'SecretProviderClass', name: 'other-vault' }] },
+        { kind: 'Job', name: 'backup-job-c', namespace: 'shop', owners: [{ kind: 'CronJob', name: 'backup' }] },
+        { kind: 'Pod', name: 'backup-d', namespace: 'shop', status: 'Pending', owners: [{ kind: 'Job', name: 'backup-job-d' }], references: [] },
+        { kind: 'Job', name: 'backup-job-d', namespace: 'shop', owners: [{ kind: 'CronJob', name: 'backup' }] },
+        { kind: 'Pod', name: 'unrelated', namespace: 'other', status: 'Pending', owners: [{ kind: 'Job', name: 'backup-job-a' }], references: [{ kind: 'SecretProviderClass', name: 'unrelated-vault' }] }
+      ],
+      issues: [
+        ...['a', 'b', 'c', 'd'].map(suffix => ({
+          kind: 'Pod', name: `backup-${suffix}`, namespace: 'shop', title: `Pod backup-${suffix}: ${suffix === 'd' ? 'ImagePullBackOff' : 'Pending'}`,
+          evidence: suffix === 'c' ? 'Different evidence' : 'Shared evidence', next: 'Check pod',
+          docs: [suffix === 'b' ? 'https://learn.microsoft.com/' : 'https://kubernetes.io/docs/']
+        })),
+        { kind: 'Pod', name: 'backup-d', namespace: 'shop', title: 'Pod backup-d: Pending',
+          evidence: 'Shared evidence', next: 'Different next step', docs: [] }
+      ]
+    };
+    if (route === 'scan') return { context: backend.context, resources: [], issues: Array.from({ length: 130 }, (_, i) => ({
+      title: `Signal ${i}`, evidence: 'Evidence', next: 'Inspect',
+      docs: i === 0 ? ['https://kubernetes.io/docs/'] : [],
       kind: i === 129 ? 'Node' : 'Pod', name: i === 0 ? 'checkout-123' : `pod-${i}`, namespace: i === 129 ? '' : 'shop'
     })), errors: partialScan ? ['Nodes: Forbidden'] : [] };
     throw new Error(`Unexpected request: ${route}`);
   };
-  const source = await readFile(new URL('../extensions/aks-canvas/ui/app.js', import.meta.url), 'utf8');
+  const source = (await readFile(new URL('../extensions/aks-canvas/ui/app.js', import.meta.url), 'utf8'))
+    .replace("import { groupFindings } from '../finding-groups.mjs';", '');
   runInNewContext(source, {
+    groupFindings,
     document: {
       getElementById: element,
       querySelector: () => ({ content: 'token' }),
-      createElement: () => element()
+      createElement: tag => element('', tag)
     },
     Option: function (text, value) { this.text = text; this.value = value; },
     URL,
@@ -81,6 +144,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
           backend.namespace = '';
           backend.editing = false;
           backend.aiIssues = [];
+          backend.resourceSummaries = [];
         }
         backend.context = body.context;
       }
@@ -90,8 +154,23 @@ test('cluster picker opens the investigation and switching clusters resets editi
         investigations.push(body.context);
         investigationRequests.push(body);
       }
-      if (route === 'ask-resource-copilot') resourceInvestigations.push(body);
-      if (route === 'ask-manual-copilot') manualInvestigations.push(body);
+      if (route === 'ask-resource-copilot') {
+        resourceInvestigations.push(body);
+        if (resourceDelay) await resourceDelay;
+        if (failResource) return { ok: false, json: async () => ({ error: 'Investigation unavailable' }) };
+        backend.resourceSummaries = backend.resourceSummaries.filter(item =>
+          item.kind !== body.kind || item.name !== body.name || item.namespace !== body.namespace);
+        backend.resourceSummaries.push({ kind: body.kind, name: body.name, namespace: body.namespace, summary: customResourceSummary || `Full Copilot summary for ${body.name}` });
+      }
+      if (route === 'ask-manual-copilot') {
+        manualInvestigations.push(body);
+        if (body.kind) {
+          if (resourceQuestionDelay) await resourceQuestionDelay;
+          backend.resourceSummaries = backend.resourceSummaries.filter(item =>
+            item.kind !== body.kind || item.name !== body.name || item.namespace !== body.namespace);
+          backend.resourceSummaries.push({ kind: body.kind, name: body.name, namespace: body.namespace, summary: 'Full answer to the resource question' });
+        }
+      }
       if (route === 'scan') scans++;
       if (route === 'scan' && delayFirstScan) {
         delayFirstScan = false;
@@ -109,6 +188,9 @@ test('cluster picker opens the investigation and switching clusters resets editi
       }
       if (route === 'workloads' && failWorkloads) {
         return { ok: false, json: async () => ({ error: 'Workloads forbidden' }) };
+      }
+      if (route === 'resource' && failResourceRead) {
+        return { ok: false, json: async () => ({ error: 'Resource forbidden' }) };
       }
       const result = respond(route, body);
       return { ok: true, json: async () => result };
@@ -137,39 +219,56 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(element('scan-result-icon').hidden, false);
   assert.equal(element('scan-result-icon').textContent, '✓');
   assert.match(element('scan-result-icon').className, /success/);
-  assert.equal(element('overview-title').textContent, 'Cluster findings');
+  assert.equal(element('overview-title').textContent, 'Findings');
   assert.equal(element('scan').hidden, false);
   assert.equal(element('ai-spinner').hidden, false);
   assert.match(element('ai-status').textContent, /reviewing the scan evidence/);
-  assert.match(element('ai-status').textContent, /first 100 of 130/);
+  assert.match(element('ai-status').textContent, /first 100 of 130 grouped findings/);
   assert.equal(investigationRequests[0].findings.length, 100);
   assert.equal(investigationRequests[0].findings[0].name, 'checkout-123');
   assert.deepEqual(investigationRequests[0].scanErrors, []);
   assert.equal(element('cluster-findings').hidden, false);
   const pendingIssue = element('issues').children[0];
-  await pendingIssue.children[4].children[0].click();
-  assert.match(element('resource-ai-status').textContent, /Copilot is checking the scan findings/);
-  assert.equal(element('resource-ai-spinner').hidden, false);
+  assert.equal(pendingIssue.children.length, 6);
+  assert.equal(pendingIssue.children[5].children.length, 1);
+  assert.equal(pendingIssue.children[5].children[0].textContent, 'Investigate resource');
+  await pendingIssue.children[5].children[0].click();
+  assert.equal(textOf(element('resource-summary')), 'Full Copilot summary for checkout-123');
+  const resourceFinding = element('resource-scan-issues').children[0];
+  assert.equal(resourceFinding.children[1].textContent, 'Evidence: Evidence');
+  assert.equal(resourceFinding.children[2].textContent, 'Next step: Inspect');
+  assert.equal(element('resource-scan-issues').children[1].children[0].href, 'https://kubernetes.io/docs/');
+  assert.equal(element('resource-ai-progress').hidden, true);
+  assert.equal(element('resource-ai-spinner').hidden, true);
   assert.equal(element('resource-manual-controls').hidden, true);
-  assert.equal(element('resource-refresh').hidden, true);
-  assert.equal(resourceInvestigations.length, 0);
+  assert.equal(element('resource-refresh').hidden, false);
+  assert.equal(resourceInvestigations.length, 1);
   releaseInvestigation();
   await selecting;
   assert.equal(element('ai-spinner').hidden, true);
   assert.equal(element('ask-copilot').hidden, false);
-  assert.match(element('ai-status').textContent, /finished/);
+  assert.equal(element('ai-progress').hidden, false);
+  assert.match(element('ai-status').textContent, /first 100 of 130 grouped findings/);
   backend.aiIssues = [{
     title: 'Copilot-improved finding', evidence: 'Copilot evidence', next: 'Review the recovery path',
     docs: [], kind: 'Pod', name: 'checkout-123', namespace: 'shop'
   }];
   pollState();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(element('resource-issues').children[0].children[0].children[0].textContent, 'Copilot-improved finding');
-  assert.match(element('resource-ai-status').textContent, /matching result is shown below/);
+  assert.equal(element('ai-progress').hidden, false);
+  assert.match(element('ai-status').textContent, /first 100 of 130 grouped findings/);
+  const published = element('resource-issues').children[0];
+  assert.equal(published.tagName, 'DETAILS');
+  assert.equal(published.children[0].textContent, 'Published Copilot findings (1)');
+  assert.equal(published.children[1].children[0].children[0].textContent, 'Copilot-improved finding');
+  assert.equal(published.children[1].children[0].children[1].textContent, 'What we know: Copilot evidence');
+  assert.equal(published.children[1].children[0].children[2].textContent, 'Suggested checks and fixes: Review the recovery path');
+  assert.equal(element('resource-ai-progress').hidden, true);
   await element('resource-back').click();
   failInvestigation = true;
   await element('ask-copilot').click();
   assert.equal(element('ai-spinner').hidden, true);
+  assert.equal(element('ai-progress').hidden, false);
   assert.match(element('ai-status').textContent, /may still be working/);
   failInvestigation = false;
   assert.equal(element('cluster-picker').hidden, true);
@@ -181,32 +280,31 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.deepEqual(investigations, ['east', 'east']);
   assert.equal(element('issues').children.length, 100);
   const actionableIssue = element('issues').children[0];
-  assert.equal(actionableIssue.children[0].children.length, 1);
-  assert.equal(actionableIssue.children[1].textContent, 'Namespace: shop');
-  assert.equal(actionableIssue.children[3].children[0].textContent, 'Suggested checks');
-  assert.equal(actionableIssue.children[3].children[1].textContent, 'Next step: Inspect');
-  assert.equal(actionableIssue.children[4].children[0].textContent, 'Investigate resource');
-  assert.equal(element('issues').children[1].children[3].children[1].textContent, 'Next step: Inspect');
+  assert.equal(actionableIssue.children[0].textContent, 'Pod checkout-123: 2 findings');
+  assert.equal(actionableIssue.children[1].textContent, 'Sources: Cluster check and Copilot');
+  assert.equal(actionableIssue.children.length, 6);
+  assert.equal(actionableIssue.children[5].children.length, 1);
+  assert.equal(actionableIssue.children[5].children[0].textContent, 'Investigate resource');
   assert.equal(element('show-more-issues').hidden, false);
   element('tab-workloads').click();
   element('show-more-issues').click();
   assert.equal(element('issues').children.length, 130);
   assert.equal(element('show-more-issues').hidden, true);
   const nodeIssue = element('issues').children[129];
-  await nodeIssue.children[3].children[0].click();
+  await nodeIssue.children[4].children[0].click();
   assert.equal(element('resource-title').textContent, 'Node / pod-129');
   assert.equal(element('resource-namespace').textContent, 'Cluster-scoped');
   assert.equal(element('resource-manual-controls').hidden, true);
-  assert.equal(resourceInvestigations.length, 0);
+  assert.equal(resourceInvestigations.length, 2);
   await element('resource-back').click();
   element('findings-filter').value = 'CHECKOUT';
   element('findings-filter').input();
   assert.equal(element('issues').children.length, 1);
-  assert.equal(element('findings-filter-status').textContent, '1 of 130 signals match.');
+  assert.equal(element('findings-filter-status').textContent, '1 of 130 grouped findings match.');
   element('findings-filter').value = 'not-a-resource';
   element('findings-filter').input();
-  assert.equal(element('issues').textContent, 'No cluster checks match this filter.');
-  assert.match(element('scan-status').textContent, /130 signals found/);
+  assert.equal(element('issues').textContent, 'No findings match this filter.');
+  assert.match(element('scan-status').textContent, /130 cluster signals grouped into 130 findings/);
   element('findings-filter').value = '';
   element('findings-filter').input();
   assert.equal(element('issues').children.length, 100);
@@ -216,8 +314,10 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(element('scan-spinner').hidden, true);
   assert.equal(element('scan').disabled, false);
   assert.equal(element('scan').hidden, false);
-  assert.equal(element('overview-title').textContent, 'Cluster findings');
-  assert.equal(element('cluster-findings').hidden, true);
+  assert.equal(element('overview-title').textContent, 'Findings');
+  assert.equal(element('cluster-findings').hidden, false);
+  assert.equal(element('issues').children.length, 1);
+  assert.equal(element('issues').children[0].children[1].textContent, 'Sources: Copilot');
   assert.equal(element('scan-result-icon').textContent, '!');
   assert.match(element('scan-status').textContent, /Scan unavailable/);
   failScan = false;
@@ -251,11 +351,13 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(scans, scansBeforeNamespaceSelection);
   assert.equal(element('refresh').disabled, false);
   assert.equal(element('panel-workloads').hidden, false);
-  assert.equal(element('copilot-findings').hidden, false);
-  assert.equal(element('ai-issues').children[0].children[0].children.length, 1);
-  assert.equal(element('ai-issues').children[0].children[1].textContent, 'Namespace: shop');
-  assert.equal(element('namespace-issues').children[0].children[0].children[1].textContent, 'Copilot finding');
-  assert.equal(element('namespace-issues').children[1].children[0].children[1].textContent, 'Automated check');
+  assert.equal(element('cluster-findings').hidden, false);
+  assert.equal(element('issues').children.length, 100);
+  assert.equal(element('issues').children[0].children[0].textContent, 'Pod other: 1 finding');
+  assert.equal(element('namespace-issues').children.length, 130);
+  const copilotCard = element('namespace-issues').children[0];
+  assert.equal(copilotCard.children[0].textContent, 'Pod other: 1 finding');
+  assert.equal(copilotCard.children[1].textContent, 'Sources: Copilot');
   const existingCard = element('namespace-issues').children[1];
   pollState();
   await new Promise(resolve => setImmediate(resolve));
@@ -288,19 +390,68 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(element('panel-workloads').hidden, true);
   assert.equal(element('resource-title').textContent, 'Pod / checkout-123');
   assert.equal(element('resource-evidence').children.length, 1);
+  assert.equal(element('resource-status').textContent, '');
   assert.equal(element('resource-events').children.length, 1);
   assert.equal(element('resource-cluster').textContent, 'east');
   assert.equal(element('resource-namespace').textContent, 'shop');
   assert.equal(element('resource-phase').textContent, 'Pending');
   assert.equal(element('resource-related').children[0].children[0].textContent, 'SecretProviderClass');
   assert.equal(element('resource-related').children[0].children[1].textContent, 'vault');
-  assert.equal(resourceInvestigations[0].name, 'checkout-123');
+  assert.equal(resourceInvestigations.at(-1).name, 'checkout-123');
   element('resource-question').value = 'Why is this pod pending?';
-  await element('ask-resource-question').click();
+  let releaseQuestion;
+  resourceQuestionDelay = new Promise(resolve => { releaseQuestion = resolve; });
+  const asking = element('ask-resource-question').click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(element('resource-summary-age').textContent, /Previous summary.*updating/);
+  assert.equal(element('resource-refresh').disabled, true);
+  assert.equal(element('resource-ai-spinner').hidden, false);
+  assert.equal(element('resource-ai-progress').hidden, false);
+  releaseQuestion();
+  await asking;
+  resourceQuestionDelay = null;
   assert.deepEqual(manualInvestigations[1], { context: 'east', namespace: 'shop', kind: 'Pod', name: 'checkout-123', question: 'Why is this pod pending?' });
-  assert.match(element('resource-question-status').textContent, /Sent to Copilot/);
+  assert.equal(element('resource-question-status').textContent, '');
+  assert.equal(element('resource-ai-progress').hidden, true);
+  assert.equal(textOf(element('resource-summary')), 'Full answer to the resource question');
+  let releaseResource;
+  resourceDelay = new Promise(resolve => { releaseResource = resolve; });
+  customResourceSummary = '## Observations\n**Pending** pod; see [guide](https://kubernetes.io/docs/).\n\n## Next steps\n1. Check `kubectl`.\n2. Review [unsafe](javascript:alert).\n\n<img src=x onerror=alert(1)>';
+  const refreshing = element('resource-refresh').click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(element('resource-summary-age').hidden, false);
+  assert.match(element('resource-summary-age').textContent, /Previous summary.*updating/);
+  assert.equal(element('resource-ai-progress').hidden, false);
+  assert.equal(element('resource-refresh').disabled, true);
+  assert.equal(element('ask-resource-question').disabled, true);
+  releaseResource();
+  await refreshing;
+  resourceDelay = null;
+  const summaryNodes = element('resource-summary').children;
+  assert.equal(summaryNodes[0].tagName, 'H4');
+  assert.equal(textOf(summaryNodes[0]), 'Observations');
+  assert.equal(summaryNodes[1].children[0].tagName, 'STRONG');
+  assert.equal(summaryNodes[1].children[2].tagName, 'A');
+  assert.equal(summaryNodes[1].children[2].href, 'https://kubernetes.io/docs/');
+  assert.equal(summaryNodes[2].tagName, 'H4');
+  assert.equal(summaryNodes[3].tagName, 'OL');
+  assert.equal(summaryNodes[3].children[1].value, 2);
+  assert.equal(summaryNodes[3].children[0].children[1].tagName, 'CODE');
+  assert.doesNotMatch(JSON.stringify(summaryNodes[3]), /"tagName":"A"/);
+  assert.match(textOf(summaryNodes[4]), /<img src=x onerror=alert\(1\)>/);
+  assert.doesNotMatch(JSON.stringify(summaryNodes[4]), /"tagName":"IMG"/);
+  assert.equal(element('resource-summary-age').hidden, true);
+  assert.equal(element('resource-ai-progress').hidden, true);
+  failResource = true;
   await element('resource-refresh').click();
-  assert.equal(resourceInvestigations.length, 2);
+  assert.equal(element('resource-summary-age').hidden, false);
+  assert.match(element('resource-summary-age').textContent, /latest investigation failed/);
+  assert.match(element('resource-ai-status').textContent, /Investigation unavailable/);
+  assert.equal(element('resource-ai-progress').hidden, false);
+  assert.equal(textOf(element('resource-summary').children[0]), 'Observations');
+  failResource = false;
+  customResourceSummary = null;
+  assert.equal(resourceInvestigations.length, 5);
   await element('resource-back').click();
   assert.equal(element('panel-workloads').hidden, false);
   assert.equal(element('namespace-controls').hidden, false);
@@ -344,6 +495,128 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(element('edit-dialog').open, true);
   await element('confirm-edit').click();
   assert.equal(backend.editing, true);
+
+  element('tab-overview').click();
+  groupedScan = true;
+  await element('scan').click();
+  backend.aiIssues = [];
+  pollState();
+  await new Promise(resolve => setImmediate(resolve));
+  await element('ask-copilot').click();
+  assert.equal(element('ai-progress').hidden, false);
+  assert.match(element('ai-status').textContent, /No resource-targeted Copilot findings are available/);
+  backend.aiIssues = [{ title: 'General finding', evidence: 'Observed', next: 'Review', docs: [] }];
+  pollState();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(element('ai-progress').hidden, false);
+  backend.aiIssues = [{
+    kind: 'Pod', name: 'backup-a', namespace: 'shop', title: 'Pending a',
+    evidence: 'Copilot interpretation', next: 'Inspect scheduling', docs: []
+  }];
+  pollState();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(element('ai-progress').hidden, true);
+  failInvestigation = true;
+  await element('ask-copilot').click();
+  assert.equal(element('ai-progress').hidden, false);
+  assert.match(element('ai-status').textContent, /may still be working/);
+  failInvestigation = false;
+  const requestsBeforeGrouped = resourceInvestigations.length;
+  await element('issues').children[0].children[5].children[0].click();
+  assert.equal(element('resource-title').textContent, 'CronJob / backup');
+  assert.equal(element('resource-phase-label').textContent, 'Schedule status');
+  assert.equal(element('resource-phase').textContent, 'Not suspended');
+  assert.equal(element('resource-pod-summary').hidden, false);
+  assert.equal(element('resource-pod-phases').textContent, '4 Pending pods');
+  assert.deepEqual(element('resource-evidence').children.map(row => row.children[0].children[0].textContent),
+    ['Schedule', 'Suspended', 'Active jobs', 'Last scheduled']);
+  const relatedFinding = element('resource-issues').children[0].children[1].children[0];
+  assert.equal(relatedFinding.children[1].textContent, 'What we know: Copilot interpretation');
+  assert.equal(relatedFinding.children[3].textContent, 'Related Pod: backup-a');
+  const groupedSignals = element('resource-scan-issues').children;
+  assert.equal(groupedSignals.length, 5);
+  assert.equal(groupedSignals[0].children[0].textContent, '2 Pods: Pending');
+  assert.equal(groupedSignals[0].children[1].textContent, 'Evidence: Shared evidence');
+  assert.equal(groupedSignals[0].children[3].tagName, 'DETAILS');
+  assert.equal(groupedSignals[0].children[3].children[0].textContent, 'View affected resources (2)');
+  assert.equal(groupedSignals[1].children[0].textContent, 'Pod backup-c: Pending');
+  assert.equal(groupedSignals[1].children[1].textContent, 'Evidence: Different evidence');
+  assert.equal(groupedSignals[2].children[0].textContent, 'Pod backup-d: ImagePullBackOff');
+  assert.equal(groupedSignals[3].children[0].textContent, 'Pod backup-d: Pending');
+  assert.equal(groupedSignals[3].children[2].textContent, 'Next step: Different next step');
+  assert.deepEqual(groupedSignals[4].children.map(link => link.href),
+    ['https://kubernetes.io/docs/', 'https://learn.microsoft.com/']);
+  assert.deepEqual(element('resource-related').children.map(button => button.children[1].textContent),
+    ['vault', 'data', 'other-vault']);
+  await element('resource-related').children[0].click();
+  assert.equal(element('resource-title').textContent, 'SecretProviderClass / vault');
+  assert.equal(resourceInvestigations.at(-1).name, 'vault');
+  await element('resource-back').click();
+  await groupedSignals[0].children[3].children[1].children[0].click();
+  assert.equal(element('resource-title').textContent, 'Pod / backup-a');
+  assert.equal(element('resource-phase-label').textContent, 'State');
+  assert.equal(element('resource-pod-summary').hidden, true);
+  assert.equal(element('resource-scan-issues').children[0].children[1].textContent, 'Evidence: Shared evidence');
+  assert.equal(element('resource-scan-issues').children.length, 2);
+  assert.deepEqual(element('resource-related').children.map(button => button.children[1].textContent),
+    ['backup-job-a', 'vault', 'data']);
+  assert.equal(resourceInvestigations.length, requestsBeforeGrouped + 3);
+  await element('resource-related').children[0].click();
+  assert.equal(element('resource-title').textContent, 'Job / backup-job-a');
+  assert.equal(element('resource-scan-issues').children[0].children[1].textContent, 'Evidence: Shared evidence');
+  assert.equal(element('resource-scan-issues').children.length, 2);
+  assert.deepEqual(element('resource-related').children.map(button => button.children[1].textContent), ['backup', 'vault', 'data']);
+  await element('resource-back').click();
+  await element('resource-back').click();
+  await element('resource-scan-issues').children[0].children[3].children[1].children[1].click();
+  assert.equal(textOf(element('resource-summary')), 'Full Copilot summary for backup-b');
+  assert.equal(element('resource-scan-issues').children[0].children[1].textContent, 'Evidence: Shared evidence');
+  assert.equal(element('resource-scan-issues').children.length, 2);
+  assert.deepEqual(element('resource-related').children.map(button => button.children[1].textContent), ['vault']);
+  await element('resource-back').click();
+  await element('resource-scan-issues').children[2].children[3].click();
+  assert.equal(element('resource-title').textContent, 'Pod / backup-d');
+  assert.equal(element('resource-related').children.length, 0);
+  assert.equal(element('resource-related').textContent, 'No supported related resources found.');
+  failResourceRead = true;
+  await element('resource-refresh').click();
+  assert.match(element('resource-status').textContent, /Resource could not be loaded: Resource forbidden/);
+  failResourceRead = false;
+  await element('resource-back').click();
+  groupedScan = false;
+  await element('resource-back').click();
+  backend.aiIssues = [];
+  pollState();
+  await new Promise(resolve => setImmediate(resolve));
+  for (const kind of ['DaemonSet', 'StatefulSet']) {
+    groupedSetKind = kind;
+    await element('scan').click();
+    const card = element('issues').children[0];
+    assert.equal(card.children[0].textContent, `${kind} worker: 2 findings`);
+    await card.children.at(-1).children[0].click();
+    assert.equal(element('resource-title').textContent, `${kind} / worker`);
+    assert.equal(element('resource-pod-phases').textContent, '2 Pending pods');
+    assert.equal(element('resource-scan-issues').children[0].children[0].textContent, '2 Pods: Pending');
+    assert.deepEqual(element('resource-related').children.map(button => button.children[1].textContent),
+      ['shared-vault', 'data-b']);
+    await element('resource-scan-issues').children[0].children[3].children[1].children[0].click();
+    assert.equal(element('resource-title').textContent, 'Pod / worker-a');
+    assert.equal(element('resource-scan-issues').children.length, 1);
+    assert.deepEqual(element('resource-related').children.map(button => button.children[1].textContent), ['shared-vault']);
+    await element('resource-back').click();
+    await element('resource-back').click();
+  }
+  groupedSetKind = '';
+  longGroupedScan = true;
+  await element('scan').click();
+  await element('ask-copilot').click();
+  const groupedEvidence = investigationRequests.at(-1).findings[0].evidence;
+  const shown = (groupedEvidence.match(/\nPod /g) || []).length;
+  const omitted = Number(groupedEvidence.match(/(\d+) additional related signals omitted from this summary\.$/)[1]);
+  assert.ok(groupedEvidence.length <= 1000);
+  assert.ok(shown > 0);
+  assert.equal(shown + omitted, 10);
+  longGroupedScan = false;
   await element('change-cluster').click();
   assert.equal(element('cluster-picker').hidden, false);
   assert.equal(element('investigation').hidden, true);
@@ -351,7 +624,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
 
   element('context').value = 'west';
   await element('context').change();
-  assert.deepEqual(investigations, ['east', 'east', 'west']);
+  assert.deepEqual(investigations, ['east', 'east', 'east', 'east', 'east', 'west']);
   assert.equal(element('cluster-title').textContent, 'west');
   assert.equal(backend.namespace, '');
   assert.equal(element('investigation').hidden, false);

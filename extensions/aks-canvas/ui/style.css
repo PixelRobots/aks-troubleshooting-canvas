@@ -64,6 +64,7 @@ h2 { font-size: 20px; line-height: 1.3; margin: 3px 0 12px; overflow-wrap: anywh
 .cluster-scan-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .cluster-scan > .hint { margin: 12px 0 18px; }
 .scan-progress { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.scan-progress:has(> #ai-progress[hidden]) { grid-template-columns: 1fr; }
 .progress-status { display: grid; grid-template-columns: 16px minmax(0, 1fr); align-content: start; gap: 3px 9px; margin: 0; padding: 13px 15px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
 .progress-status strong { color: var(--text); }
 .progress-status > span:last-child { grid-column: 2; color: var(--muted); line-height: 1.45; overflow-wrap: anywhere; }
@@ -91,6 +92,12 @@ h2 { font-size: 20px; line-height: 1.3; margin: 3px 0 12px; overflow-wrap: anywh
 .issue-card details { color: var(--muted); margin-top: 8px; }
 .issue-card summary { cursor: pointer; width: fit-content; color: var(--text); font-size: 13px; }
 .issue-card summary:focus-visible { outline: 2px solid var(--yellow); outline-offset: 3px; }
+.finding-signal { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.finding-signal > strong { overflow-wrap: anywhere; }
+.finding-signal p { white-space: pre-line; }
+.finding-signal summary { cursor: pointer; width: fit-content; font-size: 13px; font-weight: 700; }
+.finding-signal summary:focus-visible { outline: 2px solid var(--yellow); outline-offset: 3px; }
+.finding-signal .related-list { margin-top: 10px; }
 .issue-card .actions { align-items: center; margin-top: auto; padding-top: 14px; }
 .issue-card .actions a { margin-left: 4px; }
 .issue-list:not(:empty) { margin: 14px 0; }
@@ -116,11 +123,24 @@ h2 { font-size: 20px; line-height: 1.3; margin: 3px 0 12px; overflow-wrap: anywh
 .resource-metadata strong { display: block; font-size: 14px; overflow-wrap: anywhere; }
 .resource-card { min-width: 0; padding: 18px; margin: 16px 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
 .detail-grid .resource-card { margin: 0; }
+#resource-status:empty { display: none; }
 .resource-card h3 { margin: 0 0 8px; font-size: 16px; }
 .ai-summary { border-left: 3px solid var(--yellow); background: #25251c; }
 .ai-summary .issue-card { border: 0; border-top: 1px solid #6d6429; border-radius: 0; padding: 14px 0 0; }
 .ai-summary .issue-card h3 { font-size: 17px; }
 .ai-summary .issue-card p { white-space: pre-line; line-height: 1.55; }
+.resource-summary { overflow-wrap: anywhere; line-height: 1.6; }
+.resource-summary:not(:empty) { margin: 14px 0; }
+.resource-summary h4 { font-size: 15px; margin: 18px 0 6px; }
+.resource-summary p { margin: 8px 0; white-space: pre-line; }
+.resource-summary ul, .resource-summary ol { margin: 8px 0; padding-left: 24px; }
+.resource-summary li { margin: 4px 0; }
+.resource-summary code { font-family: Consolas, monospace; background: var(--surface); padding: 2px 4px; border-radius: 3px; }
+.resource-summary pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.resource-summary pre code { padding: 0; background: none; }
+.summary-age { margin: 12px 0 0; font-size: 12px; font-weight: 700; }
+.resource-published > summary { cursor: pointer; color: var(--muted); font-weight: 700; }
+.resource-published > summary:focus-visible { outline: 2px solid var(--yellow); outline-offset: 3px; }
 .related-list { display: flex; flex-wrap: wrap; gap: 10px; }
 .related-list button { text-align: left; flex: 1 1 180px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; background: #292929; border-color: #676767; }
 .related-list button span, .related-list button strong { display: block; }

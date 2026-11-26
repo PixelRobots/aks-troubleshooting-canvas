@@ -24,7 +24,7 @@
               "evidence": { "type": "string", "minLength": 1, "maxLength": 2000 },
               "next": { "type": "string", "minLength": 1, "maxLength": 2000 },
               "docs": { "type": "array", "maxItems": 5, "items": { "type": "string" } },
-              "kind": { "type": "string", "enum": ["Pod", "Deployment", "ReplicaSet", "Job", "CronJob", "PersistentVolumeClaim", "SecretProviderClass", "Node"] },
+              "kind": { "type": "string", "enum": ["Pod", "Deployment", "ReplicaSet", "Job", "CronJob", "StatefulSet", "DaemonSet", "ReplicationController", "PersistentVolumeClaim", "SecretProviderClass", "Node"] },
               "name": { "type": "string", "maxLength": 253 },
               "namespace": { "type": "string", "maxLength": 253 }
             }
@@ -52,7 +52,7 @@
                     "evidence": { "type": "string", "minLength": 1, "maxLength": 2000 },
                     "next": { "type": "string", "minLength": 1, "maxLength": 2000 },
                     "docs": { "type": "array", "maxItems": 5, "items": { "type": "string" } },
-                    "kind": { "type": "string", "enum": ["Pod", "Deployment", "ReplicaSet", "Job", "CronJob", "PersistentVolumeClaim", "SecretProviderClass", "Node"] },
+                    "kind": { "type": "string", "enum": ["Pod", "Deployment", "ReplicaSet", "Job", "CronJob", "StatefulSet", "DaemonSet", "ReplicationController", "PersistentVolumeClaim", "SecretProviderClass", "Node"] },
                     "name": { "type": "string", "maxLength": 253 },
                     "namespace": { "type": "string", "maxLength": 253 }
                   }

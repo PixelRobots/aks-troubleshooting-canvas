@@ -1,3 +1,5 @@
+import { groupFindings } from '../finding-groups.mjs';
+
 const $ = id => document.getElementById(id);
 const token = document.querySelector('meta[name="canvas-token"]').content;
 let state = { context: '', namespace: '', aiIssues: [], editing: false };
@@ -7,6 +9,7 @@ let workloadsState = 'idle';
 let workloadsVersion = 0;
 let scanCache = [];
 let scanErrors = [];
+let scanResources = [];
 let scanLimit = 100;
 let selectedResource = null;
 let resourceDetails = null;
@@ -20,7 +23,15 @@ let choosingCluster = false;
 let scanVersion = 0;
 let investigationVersion = 0;
 let clusterCopilotStatus = 'idle';
+let copilotReviewCount = 0;
+let resourceRequestVersion = 0;
+let summarySequence = 0;
+const summaryStates = new Map();
 const tabs = ['overview', 'workloads'];
+const investigableKinds = new Set([
+  'Pod', 'Deployment', 'ReplicaSet', 'Job', 'CronJob', 'StatefulSet', 'DaemonSet',
+  'ReplicationController', 'PersistentVolumeClaim', 'SecretProviderClass', 'Node'
+]);
 
 function showTab(name, focus = false) {
   activeTab = name;
@@ -78,8 +89,10 @@ function setOptions(select, items, selected, placeholder) {
 }
 function renderState(next) {
   const findingsChanged = state.context !== next.context || state.namespace !== next.namespace ||
-    JSON.stringify(state.aiIssues || []) !== JSON.stringify(next.aiIssues || []);
+    JSON.stringify(state.aiIssues || []) !== JSON.stringify(next.aiIssues || []) ||
+    JSON.stringify(state.resourceSummaries || []) !== JSON.stringify(next.resourceSummaries || []);
   state = next;
+  renderOverviewCopilotStatus();
   $('cluster-title').textContent = state.context || 'Selected cluster';
   $('mode').textContent = state.editing ? 'Editing enabled' : 'Read only';
   $('mode').classList.toggle('edit', state.editing);
@@ -87,12 +100,10 @@ function renderState(next) {
   $('toggle-edit').disabled = !state.namespace;
   $('refresh').disabled = !state.context || !state.namespace;
   if (findingsChanged) {
-    const ai = $('ai-issues');
-    ai.replaceChildren();
-    $('copilot-findings').hidden = !(state.aiIssues || []).length;
-    for (const issue of state.aiIssues || []) ai.append(issueCard(issue, 'Copilot finding', true, false));
+    renderCombinedFindings();
     renderNamespaceIssues();
     renderResourceIssues();
+    renderResourceRelated();
   }
   if (selectedResource) $('resource-scale').hidden = !(selectedResource.kind === 'Deployment' && state.editing);
 }
@@ -121,62 +132,208 @@ function row(title, details) {
   div.append(info);
   return div;
 }
-function issueCard(issue, label, inspect = true, showSource = true) {
+function findingGroups(clusterFindings = scanCache, copilotFindings = state.aiIssues || []) {
+  return groupFindings(clusterFindings, copilotFindings, scanResources).sort((left, right) =>
+    Number(right.signals.some(signal => signal.sources.includes('Copilot'))) -
+    Number(left.signals.some(signal => signal.sources.includes('Copilot')))
+  );
+}
+function sameTarget(left, right) {
+  return left.kind === right.kind && left.name === right.name && left.namespace === right.namespace;
+}
+function resourceKey(resource) {
+  return JSON.stringify([resource.namespace, resource.kind, resource.name]);
+}
+function summaryKey(resource) {
+  return JSON.stringify([resource.context, resource.namespace, resource.kind, resource.name]);
+}
+function setSummaryState(target, phase, id) {
+  const key = summaryKey(target);
+  if (id !== undefined && summaryStates.get(key)?.id !== id) return null;
+  const nextId = id ?? ++summarySequence;
+  summaryStates.set(key, { phase, id: nextId });
+  if (selectedResource && summaryKey(selectedResource) === key) renderSummaryAge();
+  return nextId;
+}
+function renderSummaryAge() {
+  const label = $('resource-summary-age');
+  const summary = selectedResource && (state.resourceSummaries || []).find(item => sameTarget(item, selectedResource));
+  const phase = selectedResource && summaryStates.get(summaryKey(selectedResource))?.phase;
+  label.hidden = !summary || !['loading', 'failed', 'previous'].includes(phase);
+  label.textContent = phase === 'loading' ? 'Previous summary · updating…'
+    : phase === 'failed' ? 'Previous summary · the latest investigation failed.'
+      : 'Previous summary · it may be out of date.';
+}
+function appendSummaryInline(container, value) {
+  const tokens = /\*\*([^*\n]+)\*\*|`([^`\n]+)`|\[([^\]\n]+)\]\(([^)\s]+)\)|\*([^*\n]+)\*/g;
+  let start = 0;
+  const text = value => {
+    const span = document.createElement('span');
+    span.textContent = value;
+    container.append(span);
+  };
+  for (const match of value.matchAll(tokens)) {
+    if (match.index > start) text(value.slice(start, match.index));
+    if (match[3]) {
+      let url;
+      try { url = new URL(match[4]); } catch { /* Display malformed links as text. */ }
+      if (url?.protocol === 'https:' && !url.username && !url.password &&
+          ['learn.microsoft.com', 'kubernetes.io'].includes(url.hostname)) {
+        const anchor = document.createElement('a');
+        anchor.href = url.href;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener noreferrer';
+        anchor.textContent = match[3];
+        container.append(anchor);
+      } else {
+        text(`${match[3]} (${match[4]})`);
+      }
+    } else {
+      const element = document.createElement(match[1] ? 'strong' : match[2] ? 'code' : 'em');
+      element.textContent = match[1] || match[2] || match[5];
+      container.append(element);
+    }
+    start = match.index + match[0].length;
+  }
+  if (start < value.length) text(value.slice(start));
+}
+function renderSummary(container, value) {
+  container.replaceChildren();
+  const lines = value.replace(/\r\n?/g, '\n').split('\n');
+  let list;
+  let listKind;
+  let paragraph = [];
+  let code = null;
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    const element = document.createElement('p');
+    appendSummaryInline(element, paragraph.join('\n'));
+    container.append(element);
+    paragraph = [];
+  };
+  const flushCode = () => {
+    const pre = document.createElement('pre');
+    const element = document.createElement('code');
+    element.textContent = code.join('\n');
+    pre.append(element);
+    container.append(pre);
+    code = null;
+  };
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) {
+      flushParagraph();
+      list = null;
+      if (code) flushCode();
+      else code = [];
+      continue;
+    }
+    if (code) { code.push(line); continue; }
+    const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+    const item = line.match(/^\s{0,3}([-*+]|\d+[.)])\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      list = null;
+      const element = document.createElement('h4');
+      appendSummaryInline(element, heading[1]);
+      container.append(element);
+    } else if (item) {
+      flushParagraph();
+      const kind = /^\d/.test(item[1]) ? 'ol' : 'ul';
+      if (!list || listKind !== kind) {
+        list = document.createElement(kind);
+        listKind = kind;
+        container.append(list);
+      }
+      const element = document.createElement('li');
+      if (kind === 'ol') element.value = Number.parseInt(item[1], 10);
+      appendSummaryInline(element, item[2]);
+      list.append(element);
+    } else {
+      list = null;
+      if (line.trim()) paragraph.push(line);
+      else flushParagraph();
+    }
+  }
+  if (code) flushCode();
+  flushParagraph();
+}
+function ownedBy(target, owner, resources) {
+  const visited = new Set();
+  let resource = target;
+  while (resource) {
+    const key = resourceKey(resource);
+    if (visited.has(key)) return false;
+    visited.add(key);
+    const parent = resources.get(key)?.owners?.[0];
+    if (!parent || !investigableKinds.has(parent.kind)) return false;
+    resource = { ...parent, namespace: parent.kind === 'Node' ? '' : resource.namespace };
+    if (sameTarget(resource, owner)) return true;
+  }
+  return false;
+}
+function findingGroupCard(group, inspect = true) {
   const card = document.createElement('article');
   card.className = 'issue-card';
-  const header = document.createElement('div');
-  header.className = 'issue-card-header';
-  const heading = document.createElement(showSource ? 'h3' : 'h4');
-  heading.textContent = issue.title;
-  header.append(heading);
-  if (showSource) {
-    const source = document.createElement('p');
-    source.className = 'issue-source';
-    source.textContent = label;
-    header.append(source);
-  }
-  const evidence = document.createElement('p');
-  evidence.textContent = `${inspect ? 'Evidence' : 'What we know'}: ${issue.evidence}`;
-  const next = document.createElement('p');
-  next.className = 'hint';
-  next.textContent = `${inspect ? 'Next step' : 'Suggested checks and fixes'}: ${issue.next}`;
-  const canInvestigate = inspect && issue.kind && issue.name && (issue.namespace || issue.kind === 'Node');
-  card.append(header);
-  if (!showSource && issue.namespace) {
+  const title = document.createElement('h3');
+  title.textContent = `${group.target.kind} ${group.target.name}: ${group.signals.length} ${group.signals.length === 1 ? 'finding' : 'findings'}`;
+  card.append(title);
+  const sources = [...new Set(group.signals.flatMap(signal => signal.sources))];
+  const source = document.createElement('p');
+  source.className = 'issue-source';
+  source.textContent = `Sources: ${sources.join(' and ')}`;
+  card.append(source);
+  if (group.target.namespace) {
     const namespace = document.createElement('p');
     namespace.className = 'issue-namespace';
-    namespace.textContent = `Namespace: ${issue.namespace}`;
+    namespace.textContent = `Namespace: ${group.target.namespace}`;
     card.append(namespace);
   }
-  card.append(evidence);
-  if (label === 'Automated check' && canInvestigate) {
-    const details = document.createElement('details');
-    const summary = document.createElement('summary');
-    summary.textContent = 'Suggested checks';
-    details.append(summary, next);
-    card.append(details);
-  } else {
-    card.append(next);
-  }
+  const resources = [...group.resources.values()];
+  const summary = document.createElement('p');
+  summary.textContent = `${resources.length} ${resources.length === 1 ? 'resource' : 'resources'} grouped under this owner.`;
+  card.append(summary);
+  const distinctTitles = [...new Set(group.signals.map(signal =>
+    signal.title.replaceAll(signal.target.name, '').replace(/\s+:/g, ':').replace(/\s+/g, ' ').trim()
+  ))];
+  const overview = document.createElement('p');
+  overview.textContent = `Signals: ${distinctTitles.slice(0, 3).join('; ')}${distinctTitles.length > 3 ? `; and ${distinctTitles.length - 3} more` : ''}`;
+  card.append(overview);
+
   const actions = document.createElement('div');
   actions.className = 'actions';
-  if (canInvestigate) {
+  if (inspect && investigableKinds.has(group.target.kind) && group.target.name &&
+      (group.target.namespace || group.target.kind === 'Node')) {
     const button = document.createElement('button');
     button.textContent = 'Investigate resource';
-    button.setAttribute('aria-label', `Investigate ${issue.kind} ${issue.name}${issue.namespace ? ` in namespace ${issue.namespace}` : ''}`);
-    button.addEventListener('click', () => perform(() => openIssue(issue)));
+    button.setAttribute('aria-label', `Investigate ${group.target.kind} ${group.target.name}${group.target.namespace ? ` in namespace ${group.target.namespace}` : ''}`);
+    button.addEventListener('click', () => perform(() => openIssue(group.target)));
     actions.append(button);
-  }
-  for (const link of issue.docs || []) {
-    const a = document.createElement('a');
-    a.href = link;
-    a.textContent = new URL(link).hostname === 'kubernetes.io' ? 'Kubernetes docs ↗' : 'AKS docs ↗';
-    a.target = '_blank';
-    a.rel = 'noopener noreferrer';
-    actions.append(a);
   }
   card.append(actions);
   return card;
+}
+function renderCombinedFindings() {
+  const container = $('issues');
+  if (!container) return;
+  container.replaceChildren();
+  const groups = findingGroups();
+  const query = $('findings-filter').value.trim().toLowerCase();
+  const matches = groups.filter(group => {
+    const values = [
+      group.target.kind, group.target.name, group.target.namespace,
+      ...group.signals.map(signal => signal.title),
+      ...[...group.resources.values()].flatMap(resource => [resource.kind, resource.name, resource.namespace])
+    ];
+    return values.some(value => value && value.toLowerCase().includes(query));
+  });
+  for (const group of matches.slice(0, scanLimit)) container.append(findingGroupCard(group));
+  $('cluster-findings').hidden = groups.length === 0;
+  const displayed = Math.min(matches.length, scanLimit);
+  $('show-more-issues').hidden = displayed >= matches.length;
+  $('findings-filter-status').textContent = query
+    ? `${matches.length} of ${groups.length} grouped findings match${matches.length > displayed ? `; showing ${displayed}` : ''}.`
+    : matches.length > displayed ? `Showing ${displayed} of ${groups.length} grouped findings.` : '';
+  if (query && !matches.length) container.textContent = 'No findings match this filter.';
 }
 async function scanIssues() {
   const context = state.context;
@@ -187,24 +344,31 @@ async function scanIssues() {
   $('scan').hidden = true;
   $('scan').disabled = true;
   $('overview-title').textContent = 'Checking cluster…';
-  $('scan-status').textContent = 'Scanning workloads and nodes…';
+  $('scan-status').textContent = 'Scanning workloads, ownership and nodes…';
   $('issues').replaceChildren();
   $('cluster-findings').hidden = true;
   $('show-more-issues').hidden = true;
   scanCache = [];
   scanErrors = [];
+  scanResources = [];
   scanLimit = 100;
+  renderCombinedFindings();
   renderNamespaceIssues();
+  renderResourceIssues();
+  renderResourceRelated();
   try {
     const result = await api('scan');
     if (state.context !== context || version !== scanVersion) return;
     scanCache = result.issues;
     scanErrors = result.errors;
+    scanResources = result.resources || [];
     renderScanIssues();
     $('scan-result-icon').textContent = scanErrors.length ? '!' : '✓';
     $('scan-result-icon').className = `result-icon ${scanErrors.length ? 'warning' : 'success'}`;
     $('scan-result-icon').hidden = false;
     renderNamespaceIssues();
+    renderResourceIssues();
+    renderResourceRelated();
     return result;
   } catch (error) {
     if (state.context === context && version === scanVersion) {
@@ -216,7 +380,7 @@ async function scanIssues() {
     throw error;
   } finally {
     if (version === scanVersion) {
-      $('overview-title').textContent = 'Cluster findings';
+      $('overview-title').textContent = 'Findings';
       $('scan-spinner').hidden = true;
       $('scan').disabled = false;
       $('scan').hidden = false;
@@ -224,20 +388,10 @@ async function scanIssues() {
   }
 }
 function renderScanIssues() {
-  const container = $('issues');
-  container.replaceChildren();
-  const query = $('findings-filter').value.trim().toLowerCase();
-  const matches = scanCache.filter(issue => [issue.title, issue.name, issue.namespace].some(value => value && value.toLowerCase().includes(query)));
-  for (const issue of matches.slice(0, scanLimit)) container.append(issueCard(issue, 'Automated check', true, false));
+  renderCombinedFindings();
   const count = scanCache.length;
-  $('cluster-findings').hidden = count === 0;
-  const displayed = Math.min(matches.length, scanLimit);
-  $('show-more-issues').hidden = displayed >= matches.length;
-  $('findings-filter-status').textContent = query
-    ? `${matches.length} of ${count} signals match${matches.length > displayed ? `; showing ${displayed}` : ''}.`
-    : matches.length > displayed ? `Showing ${displayed} of ${count} signals.` : '';
-  if (query && !matches.length) container.textContent = 'No cluster checks match this filter.';
-  const countText = `${count} ${count === 1 ? 'signal' : 'signals'} found.`;
+  const groupedCount = groupFindings(scanCache, [], scanResources).length;
+  const countText = `${count} cluster ${count === 1 ? 'signal' : 'signals'} grouped into ${groupedCount} ${groupedCount === 1 ? 'finding' : 'findings'}.`;
   $('scan-status').textContent = scanErrors.length
     ? `${countText} Some checks failed; results are incomplete: ${scanErrors.join(' | ')}`
     : count ? `Checks complete. ${countText} Investigate the evidence before making changes.`
@@ -250,79 +404,225 @@ function renderNamespaceIssues() {
     $('namespace-issue-status').textContent = 'Select a namespace to see workload signals.';
     return;
   }
-  const entries = [
-    ...(state.aiIssues || []).map(issue => ({ issue, label: 'Copilot finding' })),
-    ...scanCache.map(issue => ({ issue, label: 'Automated check' }))
-  ].filter(({ issue }) => issue.namespace === state.namespace && ['Pod', 'Deployment'].includes(issue.kind));
-  $('namespace-issue-status').textContent = entries.length
-    ? `${entries.length} workload ${entries.length === 1 ? 'signal' : 'signals'} in this namespace.`
-    : 'No workload signals to show yet. Checks and Copilot investigations may still be running or incomplete.';
-  for (const { issue, label } of entries) container.append(issueCard(issue, label));
+  const groups = findingGroups().filter(group => group.target.namespace === state.namespace);
+  $('namespace-issue-status').textContent = groups.length
+    ? `${groups.length} grouped ${groups.length === 1 ? 'finding' : 'findings'} in this namespace.`
+    : 'No workload findings to show yet. Checks and Copilot investigations may still be running or incomplete.';
+  for (const group of groups) container.append(findingGroupCard(group));
 }
-function matchesSelector(pod, selector) {
-  if (!selector || (!Object.keys(selector.matchLabels || {}).length && !(selector.matchExpressions || []).length)) return false;
-  const labels = pod.labels || {};
-  if (!Object.entries(selector.matchLabels || {}).every(([key, value]) => labels[key] === value)) return false;
-  return (selector.matchExpressions || []).every(rule => {
-    const present = Object.hasOwn(labels, rule.key);
-    if (rule.operator === 'Exists') return present;
-    if (rule.operator === 'DoesNotExist') return !present;
-    if (rule.operator === 'In') return present && (rule.values || []).includes(labels[rule.key]);
-    if (rule.operator === 'NotIn') return !present || !(rule.values || []).includes(labels[rule.key]);
-    return false;
-  });
+function renderOverviewCopilotStatus() {
+  if (clusterCopilotStatus !== 'complete') return;
+  if (copilotReviewCount > 100) {
+    $('ai-progress').hidden = false;
+    $('ai-status').textContent = `Only the first 100 of ${copilotReviewCount} grouped findings were sent to Copilot. Check chat for the review outcome.`;
+  } else if ((state.aiIssues || []).some(issue => issue.kind && issue.name)) {
+    $('ai-progress').hidden = true;
+    $('ai-status').textContent = '';
+  } else {
+    $('ai-progress').hidden = false;
+    $('ai-status').textContent = 'No resource-targeted Copilot findings are available. Check chat for the review outcome.';
+  }
+}
+function groupClusterSignals(signals) {
+  const grouped = new Map();
+  for (const signal of signals) {
+    const prefix = `${signal.kind} ${signal.name}: `;
+    const title = signal.title.startsWith(prefix) ? signal.title.slice(prefix.length) : signal.title;
+    const key = JSON.stringify([signal.kind, title, signal.evidence, signal.next]);
+    if (!grouped.has(key)) grouped.set(key, { title, sample: signal, targets: new Map() });
+    grouped.get(key).targets.set(resourceKey(signal), signal);
+  }
+  return [...grouped.values()];
 }
 function renderResourceIssues() {
   const container = $('resource-issues');
+  const scanContainer = $('resource-scan-issues');
   container.replaceChildren();
+  scanContainer.replaceChildren();
+  $('resource-summary').replaceChildren();
   if (!selectedResource) return;
-  const issues = (state.aiIssues || []).filter(issue =>
-    issue.kind === selectedResource.kind && issue.name === selectedResource.name && issue.namespace === selectedResource.namespace
+  const summary = (state.resourceSummaries || []).find(item => sameTarget(item, selectedResource));
+  if (summary) renderSummary($('resource-summary'), summary.summary);
+  renderSummaryAge();
+  $('resource-scan-status').textContent = scanErrors.length
+    ? `Some cluster checks failed; scan findings are incomplete: ${scanErrors.join(' | ')}`
+    : '';
+  const resources = new Map(scanResources.map(resource => [resourceKey(resource), resource]));
+  const groups = findingGroups().filter(group =>
+    sameTarget(group.target, selectedResource) || [...group.resources.values()].some(resource =>
+      sameTarget(resource, selectedResource) || ownedBy(resource, selectedResource, resources))
   );
-  if (!issues.length) {
+  const matchesSelected = target => sameTarget(target, selectedResource);
+  const includedTargets = groups.flatMap(group => matchesSelected(group.target)
+    ? [group.target, ...group.resources.values()]
+    : [selectedResource, ...[...group.resources.values()].filter(resource => ownedBy(resource, selectedResource, resources))]);
+  const issues = (state.aiIssues || []).filter(issue => includedTargets.some(target => sameTarget(issue, target)));
+  if (!issues.length && !summary && summaryStates.get(summaryKey(selectedResource))?.phase !== 'loading') {
     container.textContent = manualResource
-      ? 'No Copilot finding is available for this resource yet.'
-      : 'No matching Copilot finding is available from the cluster investigation.';
-    updateResourceCopilotStatus(issues.length > 0);
-    return;
+      ? 'No Copilot summary is available for this resource yet.'
+      : 'No matching Copilot summary is available from the cluster investigation.';
   }
-  for (const issue of issues) container.append(issueCard(issue, 'Copilot finding', false));
-  updateResourceCopilotStatus(true);
+  let issueContainer = container;
+  if (summary && issues.length) {
+    const details = document.createElement('details');
+    details.className = 'resource-published';
+    const label = document.createElement('summary');
+    label.textContent = `Published Copilot findings (${issues.length})`;
+    issueContainer = document.createElement('div');
+    issueContainer.className = 'issue-list';
+    details.append(label, issueContainer);
+    container.append(details);
+  }
+  for (const issue of issues) {
+    const card = document.createElement('article');
+    card.className = 'issue-card';
+    const heading = document.createElement('h3');
+    heading.textContent = issue.title;
+    const evidence = document.createElement('p');
+    evidence.textContent = `What we know: ${issue.evidence}`;
+    const next = document.createElement('p');
+    next.textContent = `Suggested checks and fixes: ${issue.next}`;
+    card.append(heading, evidence, next);
+    if (!matchesSelected(issue)) {
+      const target = document.createElement('p');
+      target.className = 'issue-source';
+      target.textContent = `Related ${issue.kind}: ${issue.name}`;
+      card.append(target);
+    }
+    issueContainer.append(card);
+  }
+  const signals = scanCache.filter(issue => includedTargets.some(target => sameTarget(issue, target)));
+  const podPhases = new Map();
+  const countedPods = new Set();
+  for (const signal of signals) {
+    if (signal.kind !== 'Pod' || countedPods.has(resourceKey(signal))) continue;
+    countedPods.add(resourceKey(signal));
+    const phase = resources.get(resourceKey(signal))?.status;
+    if (['Pending', 'Running', 'Succeeded', 'Failed', 'Unknown'].includes(phase)) {
+      podPhases.set(phase, (podPhases.get(phase) || 0) + 1);
+    }
+  }
+  $('resource-pod-summary').hidden = selectedResource.kind === 'Pod' || !podPhases.size;
+  $('resource-pod-phases').textContent = [...podPhases].map(([phase, count]) =>
+    `${count} ${phase} ${count === 1 ? 'pod' : 'pods'}`
+  ).join(' · ');
+  if (!signals.length) {
+    scanContainer.textContent = 'No matching cluster-check signals are available. Checks may be incomplete or out of date.';
+  } else {
+    for (const group of groupClusterSignals(signals)) {
+      const { sample: signal, targets } = group;
+      const item = document.createElement('div');
+      item.className = 'finding-signal';
+      const heading = document.createElement('strong');
+      heading.textContent = targets.size > 1 ? `${targets.size} ${signal.kind}s: ${group.title}` : signal.title;
+      item.append(heading);
+      if (signal.evidence) {
+        const text = document.createElement('p');
+        text.textContent = `Evidence: ${signal.evidence}`;
+        item.append(text);
+      }
+      if (signal.next) {
+        const text = document.createElement('p');
+        text.className = 'hint';
+        text.textContent = `Next step: ${signal.next}`;
+        item.append(text);
+      }
+      const affected = [...targets.values()].filter(target => !matchesSelected(target) && investigableKinds.has(target.kind));
+      const createButton = target => {
+        const button = document.createElement('button');
+        button.className = 'secondary';
+        button.textContent = `Investigate ${target.kind} ${target.name}`;
+        button.addEventListener('click', () => perform(() => openResource(target, {
+          manual: manualResource, investigate: true
+        })));
+        return button;
+      };
+      if (affected.length > 1) {
+        const details = document.createElement('details');
+        const label = document.createElement('summary');
+        label.textContent = `View affected resources (${affected.length})`;
+        const list = document.createElement('div');
+        list.className = 'related-list';
+        for (const target of affected) list.append(createButton(target));
+        details.append(label, list);
+        item.append(details);
+      } else if (affected.length === 1) {
+        item.append(createButton(affected[0]));
+      }
+      scanContainer.append(item);
+    }
+  }
+  const docs = [...new Set([...issues, ...signals].flatMap(issue => issue.docs || []))];
+  if (docs.length) {
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    for (const link of docs) {
+      const anchor = document.createElement('a');
+      anchor.href = link;
+      anchor.textContent = new URL(link).hostname === 'kubernetes.io' ? 'Kubernetes docs ↗' : 'AKS docs ↗';
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      actions.append(anchor);
+    }
+    scanContainer.append(actions);
+  }
+  updateResourceCopilotStatus(issues.length > 0);
+}
+function showResourceCopilotStatus(text, active = false) {
+  $('resource-ai-progress').hidden = false;
+  $('resource-ai-spinner').hidden = !active;
+  $('resource-ai-status').textContent = text;
+}
+function hideResourceCopilotStatus() {
+  $('resource-ai-progress').hidden = true;
+  $('resource-ai-spinner').hidden = true;
+  $('resource-ai-status').textContent = '';
 }
 function updateResourceCopilotStatus(hasFinding) {
-  if (!selectedResource || manualResource) return;
-  const active = ['waiting', 'running'].includes(clusterCopilotStatus);
-  $('resource-ai-spinner').hidden = !active;
+  if (!selectedResource || manualResource || resourceRequestVersion === resourceVersion) return;
+  if (summaryStates.get(summaryKey(selectedResource))?.phase === 'failed') {
+    showResourceCopilotStatus('The latest investigation failed. Refresh to try again.');
+    return;
+  }
+  if ((state.resourceSummaries || []).some(item => sameTarget(item, selectedResource))) {
+    hideResourceCopilotStatus();
+    return;
+  }
   if (clusterCopilotStatus === 'waiting') {
-    $('resource-ai-status').textContent = 'Copilot will review the scan findings when the cluster checks finish.';
+    showResourceCopilotStatus('Copilot will review the grouped scan findings when the cluster checks finish.', true);
   } else if (clusterCopilotStatus === 'running') {
-    $('resource-ai-status').textContent = 'Copilot is checking the scan findings. A matching result will appear here.';
+    showResourceCopilotStatus('Copilot is checking the scan findings. A matching result will appear here.', true);
   } else if (clusterCopilotStatus === 'complete') {
-    $('resource-ai-status').textContent = hasFinding
-      ? 'Copilot finished checking the scan findings. The matching result is shown below.'
-      : 'Copilot finished checking the scan findings; no matching result was published for this resource.';
+    if (hasFinding) hideResourceCopilotStatus();
+    else showResourceCopilotStatus('No matching result was published for this resource.');
   } else if (clusterCopilotStatus === 'uncertain') {
-    $('resource-ai-status').textContent = 'Copilot may still be working. Any matching result will appear here when available.';
+    showResourceCopilotStatus('Copilot may still be working. Any matching result will appear here when available.');
   } else if (clusterCopilotStatus === 'error') {
-    $('resource-ai-status').textContent = 'Copilot could not complete the cluster review. No extra resource request was sent.';
+    showResourceCopilotStatus('Copilot could not complete the cluster review. No extra resource request was sent.');
   } else {
-    $('resource-ai-status').textContent = hasFinding
-      ? 'Showing the matching Copilot finding from the earlier cluster investigation.'
-      : 'No matching Copilot finding is available from the earlier cluster investigation.';
+    if (hasFinding) hideResourceCopilotStatus();
+    else showResourceCopilotStatus('No matching Copilot finding is available from the earlier cluster investigation.');
   }
 }
 function renderResourceRelated() {
   const container = $('resource-related');
   container.replaceChildren();
   if (!resourceDetails || !selectedResource) return;
-  const related = [...resourceDetails.related];
-  if (resourceDetails.kind === 'Deployment') {
-    for (const pod of workloadsCache.filter(item => item.kind === 'Pod' && matchesSelector(item, resourceDetails.selector))) {
-      related.push({ kind: 'Pod', name: pod.name });
+  const resources = new Map(scanResources.map(resource => [resourceKey(resource), resource]));
+  const related = [...resourceDetails.related].map(item => ({
+    ...item, namespace: item.kind === 'Node' ? '' : selectedResource.namespace
+  }));
+  for (const pod of scanResources) {
+    if (pod.kind !== 'Pod' || (!sameTarget(pod, selectedResource) && !ownedBy(pod, selectedResource, resources))) continue;
+    for (const reference of pod.references || []) {
+      if (['PersistentVolumeClaim', 'SecretProviderClass'].includes(reference.kind)) {
+        related.push({ ...reference, namespace: pod.namespace });
+      }
     }
   }
-  if (!related.length) container.textContent = 'No supported related resources found.';
-  for (const item of related) {
+  const unique = related.filter((item, index) => !related.slice(0, index).some(other => sameTarget(item, other)));
+  if (!unique.length) container.textContent = 'No supported related resources found.';
+  for (const item of unique) {
     const button = document.createElement('button');
     button.className = 'secondary';
     const kind = document.createElement('span');
@@ -332,9 +632,9 @@ function renderResourceRelated() {
     const action = document.createElement('span');
     action.textContent = 'Open investigation →';
     button.append(kind, name, action);
-    button.addEventListener('click', () => perform(() => openResource({ ...item, namespace: item.kind === 'Node' ? '' : state.namespace }, {
+    button.addEventListener('click', () => perform(() => openResource(item, {
       manual: manualResource,
-      investigate: manualResource
+      investigate: true
     })));
     container.append(button);
   }
@@ -344,9 +644,11 @@ async function loadResource(target, version) {
     const result = await api('resource', target);
     if (version !== resourceVersion) return;
     resourceDetails = result.details;
-    $('resource-phase').textContent = result.details.phase || 'Not reported';
+    $('resource-phase').textContent = result.details.phase ||
+      (result.details.kind === 'CronJob' && typeof result.details.suspended === 'boolean'
+        ? (result.details.suspended ? 'Suspended' : 'Not suspended') : 'Not reported');
     $('resource-created').textContent = result.details.created || 'Not reported';
-    $('resource-status').textContent = 'Current conditions and container status from Kubernetes.';
+    $('resource-status').textContent = '';
     const evidence = $('resource-evidence');
     evidence.replaceChildren();
     for (const condition of result.details.conditions) {
@@ -357,6 +659,13 @@ async function loadResource(target, version) {
     }
     if (result.details.provider) evidence.append(row('CSI provider', result.details.provider));
     if (result.details.kind === 'Deployment') evidence.append(row('Available replicas', `${result.details.available} of ${result.details.desired}`));
+    if (result.details.kind === 'CronJob') {
+      if (result.details.schedule) evidence.append(row('Schedule', result.details.schedule));
+      if (typeof result.details.suspended === 'boolean') evidence.append(row('Suspended', result.details.suspended ? 'Yes' : 'No'));
+      if (Number.isInteger(result.details.activeJobs)) evidence.append(row('Active jobs', String(result.details.activeJobs)));
+      if (result.details.lastScheduleTime) evidence.append(row('Last scheduled', result.details.lastScheduleTime));
+      if (result.details.lastSuccessfulTime) evidence.append(row('Last successful job', result.details.lastSuccessfulTime));
+    }
     if (!evidence.children.length) evidence.textContent = 'No conditions or container status reported.';
     const events = $('resource-events');
     events.replaceChildren();
@@ -373,16 +682,34 @@ async function loadResource(target, version) {
     }
   }
 }
-async function requestResourceInvestigation(target, version) {
-  $('resource-ai-spinner').hidden = false;
-  $('resource-ai-status').textContent = 'Requesting a focused investigation in Copilot…';
+async function requestResourceInvestigation(target, version, summaryId) {
+  resourceRequestVersion = version;
+  showResourceCopilotStatus('Collecting local evidence and requesting a focused Copilot summary…', true);
   try {
     await api('ask-resource-copilot', target);
-    if (version === resourceVersion) $('resource-ai-status').textContent = 'Investigation requested. Review tool approvals; new findings will appear here. Existing findings may predate this request.';
+    if (version === resourceVersion) {
+      const nextState = await api('state');
+      if (version === resourceVersion) {
+        setSummaryState(target, 'complete', summaryId);
+        renderState(nextState);
+        if ((nextState.resourceSummaries || []).some(item => sameTarget(item, target))) hideResourceCopilotStatus();
+        else showResourceCopilotStatus('No Copilot summary was returned for this resource.');
+      } else {
+        setSummaryState(target, 'previous', summaryId);
+      }
+    }
   } catch (error) {
-    if (version === resourceVersion) $('resource-ai-status').textContent = `Copilot investigation could not be requested: ${error.message}`;
+    setSummaryState(target, 'failed', summaryId);
+    if (version === resourceVersion) showResourceCopilotStatus(`Copilot investigation could not be requested: ${error.message}`);
   } finally {
-    if (version === resourceVersion) $('resource-ai-spinner').hidden = true;
+    if (version === resourceVersion) {
+      $('resource-ai-spinner').hidden = true;
+      $('resource-refresh').disabled = false;
+      $('ask-resource-question').disabled = false;
+    } else if (summaryStates.get(summaryKey(target))?.phase === 'loading') {
+      setSummaryState(target, 'previous', summaryId);
+    }
+    if (resourceRequestVersion === version) resourceRequestVersion = 0;
   }
 }
 async function openResource(resource, { push = true, investigate = true, manual = true } = {}) {
@@ -394,9 +721,12 @@ async function openResource(resource, { push = true, investigate = true, manual 
   const target = { context: state.context, namespace: resource.namespace, kind: resource.kind, name: resource.name };
   selectedResource = target;
   manualResource = manual;
-  $('resource-ai-spinner').hidden = true;
+  hideResourceCopilotStatus();
   resourceDetails = null;
   const version = ++resourceVersion;
+  if (investigate) resourceRequestVersion = version;
+  const summaryId = investigate ? setSummaryState(target, 'loading') : null;
+  if (!investigate && summaryStates.get(summaryKey(target))?.phase !== 'failed') setSummaryState(target, 'previous');
   for (const tab of tabs) $(`panel-${tab}`).hidden = true;
   $('panel-events').hidden = true;
   $('panel-monitoring').hidden = true;
@@ -405,13 +735,17 @@ async function openResource(resource, { push = true, investigate = true, manual 
   $('panel-resource').hidden = false;
   $('panel-resource').focus();
   $('resource-manual-controls').hidden = !manual;
-  $('resource-refresh').hidden = !manual;
+  $('resource-refresh').hidden = false;
+  $('resource-refresh').disabled = investigate;
+  $('ask-resource-question').disabled = investigate;
   $('resource-title').textContent = `${target.kind} / ${target.name}`;
   $('resource-question').value = '';
   $('resource-question-status').textContent = '';
   $('resource-cluster').textContent = target.context;
   $('resource-namespace').textContent = target.kind === 'Node' ? 'Cluster-scoped' : target.namespace;
+  $('resource-phase-label').textContent = target.kind === 'CronJob' ? 'Schedule status' : 'State';
   $('resource-phase').textContent = 'Loading…';
+  $('resource-pod-summary').hidden = true;
   $('resource-created').textContent = 'Loading…';
   $('resource-status').textContent = 'Loading resource…';
   $('resource-evidence').replaceChildren();
@@ -425,17 +759,16 @@ async function openResource(resource, { push = true, investigate = true, manual 
   $('describe-output').textContent = 'Not loaded.';
   logsLoaded = false;
   renderResourceIssues();
-  if (manual) {
-    $('resource-ai-status').textContent = investigate
-      ? 'Loading evidence before requesting a Copilot summary…'
-      : 'Review the available findings below. They may predate the latest evidence.';
-  } else {
-    updateResourceCopilotStatus((state.aiIssues || []).some(issue =>
-      issue.kind === selectedResource.kind && issue.name === selectedResource.name && issue.namespace === selectedResource.namespace
-    ));
+  if (investigate) {
+    showResourceCopilotStatus('Loading evidence before requesting a Copilot summary…', true);
+  }
+  else if (manual) {
+    if (summaryStates.get(summaryKey(target))?.phase === 'failed') showResourceCopilotStatus('The latest investigation failed. Refresh to try again.');
+    else if (!(state.resourceSummaries || []).some(item => sameTarget(item, target))) showResourceCopilotStatus('Review the available findings below. They may predate the latest evidence.');
   }
   await loadResource(target, version);
-  if (investigate && version === resourceVersion) await requestResourceInvestigation(target, version);
+  if (investigate && version === resourceVersion) await requestResourceInvestigation(target, version, summaryId);
+  else if (investigate) setSummaryState(target, 'previous', summaryId);
 }
 async function scaleDeployment(item) {
   const answer = window.prompt(`Scale ${item.name} in ${state.context} / ${state.namespace} to how many replicas?`, '1');
@@ -457,7 +790,7 @@ async function openIssue(issue) {
     clearTargetData();
     loadWorkloads().catch(error => message(error.message));
   }
-  await openResource(issue, { investigate: false, manual: false });
+  await openResource(issue, { investigate: true, manual: false });
 }
 async function loadWorkloads() {
   const target = `${state.context}\0${state.namespace}`;
@@ -623,7 +956,10 @@ $('context').addEventListener('change', () => perform(async () => {
     renderState(await api('select-context', { context }));
     if (changed) {
       scanCache = [];
+      scanErrors = [];
+      scanResources = [];
       $('findings-filter').value = '';
+      renderCombinedFindings();
       $('cluster-question').value = '';
       $('cluster-question-status').textContent = '';
       clearTargetData();
@@ -633,11 +969,12 @@ $('context').addEventListener('change', () => perform(async () => {
     showInvestigation();
     $('context').disabled = false;
     investigationVersion++;
+    $('ai-progress').hidden = false;
     $('ai-spinner').hidden = false;
     $('ask-copilot').disabled = true;
     $('ask-copilot').hidden = true;
     clusterCopilotStatus = 'waiting';
-    $('ai-status').textContent = 'Waiting for cluster checks before Copilot investigates…';
+    $('ai-status').textContent = 'Waiting for cluster checks before Copilot reviews grouped findings…';
     const scan = scanIssues();
     const investigation = scan.then(
       result => result && state.context === context ? requestInvestigation(context, result.issues, result.errors) : undefined,
@@ -690,25 +1027,40 @@ $('findings-filter').addEventListener('input', () => { scanLimit = 100; renderSc
 $('show-more-issues').addEventListener('click', () => { scanLimit += 100; renderScanIssues(); });
 async function requestInvestigation(context, findings = scanCache, errors = scanErrors) {
   const version = ++investigationVersion;
+  const groupedFindings = groupFindings(findings, [], scanResources);
   clusterCopilotStatus = 'running';
+  copilotReviewCount = groupedFindings.length;
+  $('ai-progress').hidden = false;
   $('ai-spinner').hidden = false;
   $('ask-copilot').hidden = true;
   $('ask-copilot').disabled = true;
-  const coverage = findings.length > 100 ? ` Reviewing the first 100 of ${findings.length} signals.` : '';
+  const coverage = groupedFindings.length > 100 ? ` Reviewing the first 100 of ${groupedFindings.length} grouped findings.` : '';
   $('ai-status').textContent = `Copilot is reviewing the scan evidence…${coverage} Check chat for any tool approval requests.`;
   try {
-    const signals = findings.slice(0, 100).map(({ title, evidence, next, kind, name, namespace }) => ({
-      title: title.slice(0, 500),
-      evidence: evidence.slice(0, 1000),
-      next: next.slice(0, 1000),
-      kind,
-      name: name.slice(0, 253),
-      namespace: namespace.slice(0, 253)
-    }));
+    const signals = groupedFindings.slice(0, 100).map(group => {
+      const evidence = [`${group.signals.length} signals across ${group.resources.size} related resources.`];
+      let included = 0;
+      for (const signal of group.signals.slice(0, 8)) {
+        const line = `${signal.target.kind} ${signal.target.name}: ${signal.title}. ${signal.evidence.join(' ')}`;
+        if ([...evidence, line].join('\n').length > 930) break;
+        evidence.push(line);
+        included++;
+      }
+      const remaining = group.signals.length - included;
+      if (remaining > 0) evidence.push(`${remaining} additional related signals omitted from this summary.`);
+      return {
+        title: `${group.target.kind} ${group.target.name}: ${group.signals.length} grouped signals`.slice(0, 500),
+        evidence: evidence.join('\n'),
+        next: [...new Set(group.signals.flatMap(signal => signal.next))].slice(0, 3).join(' ').slice(0, 1000) || 'Review the supporting signals and confirm their scope before making changes.',
+        kind: group.target.kind,
+        name: group.target.name.slice(0, 253),
+        namespace: group.target.namespace.slice(0, 253)
+      };
+    });
     await api('ask-copilot', { context, findings: signals, scanErrors: errors.slice(0, 20).map(error => error.slice(0, 500)) });
     if (state.context === context && version === investigationVersion) {
       clusterCopilotStatus = 'complete';
-      $('ai-status').textContent = `Copilot request finished.${coverage} Check chat for the outcome and any limitations.`;
+      renderOverviewCopilotStatus();
     }
   } catch (error) {
     if (state.context === context && version === investigationVersion) {
@@ -744,18 +1096,43 @@ async function askManualQuestion(resource = false) {
     return;
   }
   const version = resourceVersion;
+  const summaryId = resource ? setSummaryState(target, 'loading') : null;
   button.disabled = true;
-  status.textContent = 'Sending to Copilot…';
+  if (resource) {
+    resourceRequestVersion = version;
+    $('resource-refresh').disabled = true;
+    showResourceCopilotStatus('Collecting evidence and waiting for Copilot…', true);
+  }
+  status.textContent = resource ? '' : 'Sending to Copilot…';
   try {
     await api('ask-manual-copilot', { ...target, question });
     if (state.context === target.context && (!resource || version === resourceVersion)) {
+      if (resource) {
+        const nextState = await api('state');
+        if (state.context !== target.context || version !== resourceVersion) return;
+        setSummaryState(target, 'complete', summaryId);
+        renderState(nextState);
+        if ((nextState.resourceSummaries || []).some(item => sameTarget(item, target))) hideResourceCopilotStatus();
+        else showResourceCopilotStatus('No Copilot summary was returned for this resource.');
+      }
       input.value = '';
-      status.textContent = 'Sent to Copilot. Check chat for the response and tool approvals.';
+      status.textContent = resource ? '' : 'Sent to Copilot. Check chat for the response and tool approvals.';
     }
   } catch (error) {
+    if (resource) setSummaryState(target, 'failed', summaryId);
     if (state.context === target.context && (!resource || version === resourceVersion)) status.textContent = `Could not send to Copilot: ${error.message}`;
+    if (resource && version === resourceVersion) showResourceCopilotStatus('The latest Copilot question could not be completed.');
   } finally {
-    button.disabled = false;
+    if (!resource || version === resourceVersion) {
+      button.disabled = false;
+      if (resource) {
+        $('resource-refresh').disabled = false;
+        $('resource-ai-spinner').hidden = true;
+      }
+    } else if (resource && summaryStates.get(summaryKey(target))?.phase === 'loading') {
+      setSummaryState(target, 'previous', summaryId);
+    }
+    if (resource && resourceRequestVersion === version) resourceRequestVersion = 0;
   }
 }
 $('ask-cluster-question').addEventListener('click', () => askManualQuestion());
@@ -777,7 +1154,7 @@ $('resource-refresh').addEventListener('click', () => perform(async () => {
   if (selectedResource) await openResource(selectedResource, {
     push: false,
     manual: manualResource,
-    investigate: manualResource
+    investigate: true
   });
 }));
 $('resource-scale').addEventListener('click', () => perform(async () => {

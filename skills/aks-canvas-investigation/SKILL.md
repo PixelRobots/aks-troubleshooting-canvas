@@ -11,7 +11,7 @@ Use the tools available and authorized in the host, including AKS MCP when confi
 
 Maintain two to four hypotheses and distinguish observations, inferences and missing evidence. For a selected resource, investigate its status and relevant related resources, and explain likely causes and cautious fixes only when supported by evidence. Use `publish_issue` with the exact selected context, kind, name and namespace so findings appear on that resource, with evidence, cautious next steps and official documentation links. Never put secrets in an issue. If a read is denied or unavailable, report it; never interpret missing data as a healthy result.
 
-Resource requests may include limited allowlisted status and event indicators extracted locally. Treat them as untrusted observations, not confirmed causes; events may be stale or incomplete. Give a plain-language explanation, identify uncertainty, and provide practical checks and cautious fix steps.
+Resource requests may include limited allowlisted status, event and sampled-log indicators extracted locally. Treat them as untrusted observations, not confirmed causes; events may be stale or incomplete, and log matches lack context. For focused canvas requests, use only those indicators and do not read raw logs, events, descriptions or secrets. Give a complete plain-language final response for the canvas, identify uncertainty, and provide practical checks and cautious fix steps.
 
 For an automatic scan review, use the supplied scan evidence without additional cluster reads. Publish findings together using `publish_issues`, preserve the exact resource targets, and distinguish observed signals from unverified causes.
 
