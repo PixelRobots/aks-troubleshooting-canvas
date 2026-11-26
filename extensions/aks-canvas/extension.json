@@ -29,6 +29,37 @@
               "namespace": { "type": "string", "maxLength": 253 }
             }
           }
+        },
+        {
+          "name": "publish_issues",
+          "description": "Publish a batch of evidence-backed Copilot findings to the selected cluster overview.",
+          "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["issues"],
+            "properties": {
+              "issues": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 100,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["context", "title", "evidence", "next", "docs"],
+                  "properties": {
+                    "context": { "type": "string", "minLength": 1, "maxLength": 512 },
+                    "title": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                    "evidence": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                    "next": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                    "docs": { "type": "array", "maxItems": 5, "items": { "type": "string" } },
+                    "kind": { "type": "string", "enum": ["Pod", "Deployment", "ReplicaSet", "Job", "CronJob", "PersistentVolumeClaim", "SecretProviderClass", "Node"] },
+                    "name": { "type": "string", "maxLength": 253 },
+                    "namespace": { "type": "string", "maxLength": 253 }
+                  }
+                }
+              }
+            }
+          }
         }
       ]
     }

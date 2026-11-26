@@ -17,6 +17,9 @@ function summarizeResourceEvidence(details, events, eventError) {
     if (condition.type === 'PodScheduled' && condition.status === 'False' && condition.reason === 'Unschedulable') {
       signals.add('The PodScheduled condition reports Unschedulable.');
     }
+    if (details.kind === 'Node' && condition.type === 'Ready' && ['False', 'Unknown'].includes(condition.status)) {
+      signals.add(`The node Ready condition reports ${condition.status}.`);
+    }
   }
   for (const container of details.containers || []) {
     if (['ContainerCreating', 'CrashLoopBackOff', 'ImagePullBackOff', 'ErrImagePull', 'CreateContainerConfigError'].includes(container.waitingReason)) {
@@ -41,7 +44,7 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
   const evidenceKey = (context, resource) => JSON.stringify([context, resource.namespace, resource.kind, resource.name]);
   const token = randomBytes(32).toString('hex');
   const getContext = () => ({ ...state, aiIssues: [...state.aiIssues] });
-  const publishIssue = issue => {
+  const validateIssue = issue => {
     if (!issue || issue.context !== state.context || !state.context) throw new Error('The selected context has changed.');
     for (const field of ['title', 'evidence', 'next']) {
       if (typeof issue[field] !== 'string' || !issue[field].trim() || issue[field].length > 2000) throw new Error(`Invalid issue ${field}.`);
@@ -56,13 +59,24 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
     })) throw new Error('Documentation links must be HTTPS links to Microsoft Learn or kubernetes.io.');
     const hasResource = issue.kind !== undefined || issue.name !== undefined || issue.namespace !== undefined;
     if (hasResource) validateResourceTarget(issue);
-    const saved = { title: issue.title, evidence: issue.evidence, next: issue.next, docs: issue.docs, ...(hasResource ? { kind: issue.kind, name: issue.name, namespace: issue.namespace } : {}) };
+    return { title: issue.title, evidence: issue.evidence, next: issue.next, docs: issue.docs, ...(hasResource ? { kind: issue.kind, name: issue.name, namespace: issue.namespace } : {}) };
+  };
+  const saveIssue = saved => {
     const existing = state.aiIssues.findIndex(item =>
       item.title === saved.title && item.kind === saved.kind && item.name === saved.name && item.namespace === saved.namespace
     );
     if (existing < 0) state.aiIssues.push(saved);
     else state.aiIssues[existing] = saved;
+  };
+  const publishIssue = issue => {
+    saveIssue(validateIssue(issue));
     return getContext();
+  };
+  const publishIssues = issues => {
+    if (!Array.isArray(issues) || issues.length < 1 || issues.length > 100) throw new Error('Provide between 1 and 100 issues.');
+    const validated = issues.map(validateIssue);
+    for (const issue of validated) saveIssue(issue);
+    return { published: validated.length };
   };
   const server = createServer(async (req, res) => {
     const send = (status, data, type = 'application/json; charset=utf-8') => {
@@ -99,7 +113,9 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Invalid request.');
       const target = () => {
-        if (body.context !== state.context || body.namespace !== state.namespace || !state.context || !state.namespace) {
+        const clusterNode = body.kind === 'Node' && body.namespace === '';
+        if (body.context !== state.context || !state.context ||
+            (!clusterNode && (body.namespace !== state.namespace || !state.namespace))) {
           throw new Error('The selected context or namespace has changed.');
         }
         return validateResourceTarget({ kind: body.kind, name: body.name, namespace: body.namespace });
@@ -261,6 +277,7 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
     url: `http://127.0.0.1:${server.address().port}/`,
     getContext,
     publishIssue,
+    publishIssues,
     close: () => new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   };
 }

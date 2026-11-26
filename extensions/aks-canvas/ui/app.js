@@ -140,7 +140,7 @@ function issueCard(issue, label, inspect = true, showSource = true) {
   const next = document.createElement('p');
   next.className = 'hint';
   next.textContent = `${inspect ? 'Next step' : 'Suggested checks and fixes'}: ${issue.next}`;
-  const canInvestigate = inspect && issue.kind && issue.namespace && issue.name;
+  const canInvestigate = inspect && issue.kind && issue.name && (issue.namespace || issue.kind === 'Node');
   card.append(header);
   if (!showSource && issue.namespace) {
     const namespace = document.createElement('p');
@@ -163,7 +163,7 @@ function issueCard(issue, label, inspect = true, showSource = true) {
   if (canInvestigate) {
     const button = document.createElement('button');
     button.textContent = 'Investigate resource';
-    button.setAttribute('aria-label', `Investigate ${issue.kind} ${issue.name} in namespace ${issue.namespace}`);
+    button.setAttribute('aria-label', `Investigate ${issue.kind} ${issue.name}${issue.namespace ? ` in namespace ${issue.namespace}` : ''}`);
     button.addEventListener('click', () => perform(() => openIssue(issue)));
     actions.append(button);
   }
@@ -332,7 +332,7 @@ function renderResourceRelated() {
     const action = document.createElement('span');
     action.textContent = 'Open investigation →';
     button.append(kind, name, action);
-    button.addEventListener('click', () => perform(() => openResource({ ...item, namespace: state.namespace }, {
+    button.addEventListener('click', () => perform(() => openResource({ ...item, namespace: item.kind === 'Node' ? '' : state.namespace }, {
       manual: manualResource,
       investigate: manualResource
     })));
@@ -451,7 +451,7 @@ async function openIssue(issue) {
   const context = state.context;
   renderState(await api('state'));
   if (state.context !== context) throw new Error('The selected cluster changed before the finding was opened.');
-  if (state.namespace !== issue.namespace) {
+  if (issue.kind !== 'Node' && state.namespace !== issue.namespace) {
     renderState(await api('select-namespace', { namespace: issue.namespace }));
     $('namespace').value = issue.namespace;
     clearTargetData();
@@ -519,7 +519,7 @@ function renderWorkloads(selected = $('workload-select').value) {
     button.className = 'secondary';
     button.textContent = 'Investigate';
     button.setAttribute('aria-label', `Investigate ${item.kind} ${item.name}`);
-    button.addEventListener('click', () => perform(() => openResource({ ...item, namespace: state.namespace }, { manual: manualResource })));
+    button.addEventListener('click', () => perform(() => openResource({ ...item, namespace: state.namespace }, { manual: true })));
     element.append(button);
     container.append(element);
   }
@@ -632,6 +632,7 @@ $('context').addEventListener('change', () => perform(async () => {
     $('namespace').disabled = true;
     showInvestigation();
     $('context').disabled = false;
+    investigationVersion++;
     $('ai-spinner').hidden = false;
     $('ask-copilot').disabled = true;
     $('ask-copilot').hidden = true;
@@ -693,7 +694,8 @@ async function requestInvestigation(context, findings = scanCache, errors = scan
   $('ai-spinner').hidden = false;
   $('ask-copilot').hidden = true;
   $('ask-copilot').disabled = true;
-  $('ai-status').textContent = 'Copilot is investigating… Check chat for any tool approval requests.';
+  const coverage = findings.length > 100 ? ` Reviewing the first 100 of ${findings.length} signals.` : '';
+  $('ai-status').textContent = `Copilot is reviewing the scan evidence…${coverage} Check chat for any tool approval requests.`;
   try {
     const signals = findings.slice(0, 100).map(({ title, evidence, next, kind, name, namespace }) => ({
       title: title.slice(0, 500),
@@ -706,7 +708,7 @@ async function requestInvestigation(context, findings = scanCache, errors = scan
     await api('ask-copilot', { context, findings: signals, scanErrors: errors.slice(0, 20).map(error => error.slice(0, 500)) });
     if (state.context === context && version === investigationVersion) {
       clusterCopilotStatus = 'complete';
-      $('ai-status').textContent = 'Copilot request finished. Check chat for the outcome and any limitations.';
+      $('ai-status').textContent = `Copilot request finished.${coverage} Check chat for the outcome and any limitations.`;
     }
   } catch (error) {
     if (state.context === context && version === investigationVersion) {

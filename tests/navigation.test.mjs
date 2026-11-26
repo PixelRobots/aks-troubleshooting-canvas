@@ -58,7 +58,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
     };
     if (route === 'scan') return { context: backend.context, issues: Array.from({ length: 130 }, (_, i) => ({
       title: `Signal ${i}`, evidence: 'Evidence', next: 'Inspect', docs: [],
-      kind: 'Pod', name: i === 0 ? 'checkout-123' : `pod-${i}`, namespace: 'shop'
+      kind: i === 129 ? 'Node' : 'Pod', name: i === 0 ? 'checkout-123' : `pod-${i}`, namespace: i === 129 ? '' : 'shop'
     })), errors: partialScan ? ['Nodes: Forbidden'] : [] };
     throw new Error(`Unexpected request: ${route}`);
   };
@@ -140,7 +140,8 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(element('overview-title').textContent, 'Cluster findings');
   assert.equal(element('scan').hidden, false);
   assert.equal(element('ai-spinner').hidden, false);
-  assert.match(element('ai-status').textContent, /investigating/);
+  assert.match(element('ai-status').textContent, /reviewing the scan evidence/);
+  assert.match(element('ai-status').textContent, /first 100 of 130/);
   assert.equal(investigationRequests[0].findings.length, 100);
   assert.equal(investigationRequests[0].findings[0].name, 'checkout-123');
   assert.deepEqual(investigationRequests[0].scanErrors, []);
@@ -191,6 +192,13 @@ test('cluster picker opens the investigation and switching clusters resets editi
   element('show-more-issues').click();
   assert.equal(element('issues').children.length, 130);
   assert.equal(element('show-more-issues').hidden, true);
+  const nodeIssue = element('issues').children[129];
+  await nodeIssue.children[3].children[0].click();
+  assert.equal(element('resource-title').textContent, 'Node / pod-129');
+  assert.equal(element('resource-namespace').textContent, 'Cluster-scoped');
+  assert.equal(element('resource-manual-controls').hidden, true);
+  assert.equal(resourceInvestigations.length, 0);
+  await element('resource-back').click();
   element('findings-filter').value = 'CHECKOUT';
   element('findings-filter').input();
   assert.equal(element('issues').children.length, 1);
@@ -304,6 +312,11 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(element('resource-title').textContent, 'Deployment / checkout');
   assert.equal(resourceInvestigations.at(-1).kind, 'Deployment');
   assert.equal(resourceInvestigations.at(-1).namespace, 'shop');
+  await element('resource-back').click();
+  const investigationsBeforeBrowse = resourceInvestigations.length;
+  await element('workloads').children[0].children[1].click();
+  assert.equal(element('resource-manual-controls').hidden, false);
+  assert.equal(resourceInvestigations.length, investigationsBeforeBrowse + 1);
   await element('resource-back').click();
   await element('refresh').click();
   assert.equal(element('workload-select').value, JSON.stringify(['Deployment', 'checkout']));

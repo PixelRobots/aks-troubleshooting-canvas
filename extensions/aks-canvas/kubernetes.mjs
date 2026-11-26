@@ -27,7 +27,7 @@ const resourceKinds = {
 export function validateResourceTarget(target) {
   if (!target || !Object.hasOwn(resourceKinds, target.kind)) throw new Error('Unsupported resource kind.');
   resourceName(target.name, 'resource name');
-  resourceName(target.namespace, 'namespace');
+  if (target.kind !== 'Node' || target.namespace !== '') resourceName(target.namespace, 'namespace');
   return target;
 }
 

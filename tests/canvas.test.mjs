@@ -6,11 +6,13 @@ import { createInstance } from '../extensions/aks-canvas/server.mjs';
 import { detectIssues } from '../extensions/aks-canvas/issues.mjs';
 import { checkDeallocatedNodes, describeAzureFailure } from '../extensions/aks-canvas/azure.mjs';
 
-test('canvas manifest exposes the publish_issue action with its input schema', async () => {
+test('canvas manifest exposes single and batch issue publishing', async () => {
   const manifest = JSON.parse(await readFile(new URL('../extensions/aks-canvas/extension.json', import.meta.url), 'utf8'));
   const action = manifest.canvases[0].actions.find(item => item.name === 'publish_issue');
   assert.ok(action);
   assert.ok(action.inputSchema.required.includes('evidence'));
+  const batch = manifest.canvases[0].actions.find(item => item.name === 'publish_issues');
+  assert.ok(batch.inputSchema.properties.issues.items.required.includes('evidence'));
 });
 
 test('issue checks report current signals with evidence without treating normal workloads as problems', () => {
@@ -308,6 +310,38 @@ test('cluster scan reports partial failures and rejects stale or unsafe AI issue
   assert.throws(() => instance.publishIssue({ ...issue, context: 'other' }), /context has changed/);
   assert.throws(() => instance.publishIssue({ ...issue, docs: ['https://evil.example/'] }), /Documentation links/);
   assert.throws(() => instance.publishIssue({ ...issue, kind: 'Pod', name: '--all', namespace: 'shop' }), /Invalid resource name/);
+  const node = { ...issue, title: 'Node not ready', kind: 'Node', name: 'node-a', namespace: '' };
+  assert.throws(() => instance.publishIssues([node, { ...issue, context: 'other' }]), /context has changed/);
+  assert.equal(instance.getContext().aiIssues.length, 2);
+  assert.deepEqual(instance.publishIssues([node, { ...issue, title: 'Second finding' }]), { published: 2 });
+  assert.equal(instance.getContext().aiIssues[2].namespace, '');
+  assert.throws(() => instance.publishIssues([]), /between 1 and 100/);
+});
+
+test('cluster-scoped nodes can be inspected without selecting a namespace', async t => {
+  const calls = [];
+  const kubernetes = createKubernetes(async args => {
+    calls.push(args);
+    if (args[0] === 'config') return 'ctx\n';
+    if (args.includes('events')) return JSON.stringify({ items: [] });
+    return JSON.stringify({ metadata: { name: 'node-a', uid: 'uid-123' }, status: { conditions: [{ type: 'Ready', status: 'False' }] } });
+  });
+  const instance = await createInstance({ kubernetes });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = (path, data) => fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  });
+  await request('select-context', { context: 'ctx' });
+  const node = { context: 'ctx', kind: 'Node', name: 'node-a', namespace: '' };
+  const response = await request('resource', node);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).details.conditions[0].status, 'False');
+  assert.ok(calls.some(args => args.includes('nodes') && !args.includes('-n')));
+  assert.ok(calls.some(args => args.includes('events') && args.includes('--all-namespaces')));
+  assert.equal((await request('resource', { ...node, context: 'other' })).status, 400);
+  assert.equal((await request('resource', { ...node, kind: 'Pod' })).status, 400);
 });
 
 test('scan retains unknown nodes and reports Azure verification failures', async t => {

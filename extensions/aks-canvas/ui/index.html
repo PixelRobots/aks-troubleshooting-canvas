@@ -45,7 +45,7 @@
           <div><p class="eyebrow">CLUSTER INVESTIGATION</p><h2 id="overview-title">Cluster findings</h2></div>
           <div class="cluster-scan-actions"><button id="scan" class="secondary" hidden>Rescan cluster</button><button id="ask-copilot" class="secondary" hidden>Investigate again</button></div>
         </div>
-        <p class="hint">Copilot verifies findings from the read-only workload and node checks.</p>
+        <p class="hint">Copilot reviews signals from read-only workload and node checks; further investigation may be needed to confirm a cause. Rescanning updates the checks only. Choose Investigate again to request a new Copilot review; earlier findings may remain visible.</p>
         <div class="scan-progress">
           <p role="status" class="progress-status"><span class="status-indicator"><span id="ai-spinner" class="spinner" aria-hidden="true" hidden></span></span><strong>Copilot</strong><span id="ai-status">Select a cluster to start an investigation.</span></p>
           <p role="status" class="progress-status"><span class="status-indicator"><span id="scan-spinner" class="spinner" aria-hidden="true" hidden></span><span id="scan-result-icon" class="result-icon" aria-hidden="true" hidden></span></span><strong>Cluster checks</strong><span id="scan-status">Select a cluster to start checks.</span></p>
