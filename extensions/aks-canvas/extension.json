@@ -9,21 +9,24 @@
       "actions": [
         {
           "name": "get_context",
-          "description": "Get the selected Kubernetes context, namespace, and investigation notes."
+          "description": "Get the selected Kubernetes context, namespace, and Copilot issues."
         },
         {
-          "name": "add_finding",
-          "description": "Add an evidence-backed finding to the current investigation without saving it to disk.",
+          "name": "publish_issue",
+          "description": "Publish a sourced, evidence-backed Copilot investigation issue to the selected cluster overview.",
           "inputSchema": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["text"],
+            "required": ["context", "title", "evidence", "next", "docs"],
             "properties": {
-              "text": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 2000
-              }
+              "context": { "type": "string", "minLength": 1, "maxLength": 512 },
+              "title": { "type": "string", "minLength": 1, "maxLength": 2000 },
+              "evidence": { "type": "string", "minLength": 1, "maxLength": 2000 },
+              "next": { "type": "string", "minLength": 1, "maxLength": 2000 },
+              "docs": { "type": "array", "maxItems": 5, "items": { "type": "string" } },
+              "kind": { "type": "string", "enum": ["Pod", "Deployment", "ReplicaSet", "Job", "CronJob", "PersistentVolumeClaim", "SecretProviderClass", "Node"] },
+              "name": { "type": "string", "maxLength": 253 },
+              "namespace": { "type": "string", "maxLength": 253 }
             }
           }
         }

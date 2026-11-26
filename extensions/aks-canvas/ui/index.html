@@ -9,28 +9,163 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header>
-    <div><p class="eyebrow">PIXEL ROBOTS / AKS</p><h1>Troubleshooting canvas<span class="dot">.</span></h1><p class="subtitle">From cluster signals to confident next steps.</p></div>
-    <span id="mode" class="badge">READ ONLY</span>
+  <header class="masthead">
+    <a class="brand" href="https://pixelrobots.co.uk" target="_blank" rel="noopener noreferrer">Pixel Robots<span>.</span></a>
+    <span class="masthead-label">AKS TROUBLESHOOTING</span>
+    <button id="toggle-edit" class="mode-switch" role="switch" aria-checked="false" aria-label="Editing mode" disabled><span id="mode">Read only</span><span class="switch-track" aria-hidden="true"><span></span></span></button>
   </header>
+  <div id="hero" class="hero">
+    <p class="hero-label">PIXEL ROBOTS / AKS</p>
+    <h1>Troubleshooting canvas<span class="dot">.</span></h1>
+    <p>From cluster signals to confident next steps.</p>
+  </div>
   <main>
     <div id="status" role="status" aria-live="polite"></div>
-    <section class="panel">
-      <div class="section-title"><div><p class="eyebrow">01 / CONNECT</p><h2>Choose your target</h2></div><button id="refresh-contexts" class="secondary">Refresh contexts</button></div>
-      <p class="hint">Uses your existing kubeconfig and permissions. Selecting a context does not change your active kubectl context.</p>
-      <div class="controls"><label>Cluster context<select id="context"><option value="">Select a context</option></select></label><label>Namespace<select id="namespace" disabled><option value="">Select a namespace</option></select></label><button id="refresh" disabled>Refresh data</button></div>
+    <section id="cluster-picker" class="panel picker">
+      <div class="section-title"><div><p class="eyebrow">GET STARTED</p><h2>Choose a cluster</h2></div><button id="refresh-contexts" class="secondary">Refresh contexts</button></div>
+      <p class="hint">Select a Kubernetes context from your existing kubeconfig. Your active kubectl context will not be changed.</p>
+      <p class="hint">Selecting a cluster automatically requests a read-only Copilot investigation. Authorized tools may share cluster evidence with Copilot; sensitive logs require your approval.</p>
+      <label for="context">Cluster context</label>
+      <select id="context"><option value="">Select a context</option></select>
+      <p class="hint">Contexts can refer to non-AKS clusters too. Your existing access and network connection are required.</p>
     </section>
-    <div class="grid">
-      <section class="panel"><div class="section-title"><div><p class="eyebrow">02 / EXPLORE</p><h2>Workloads</h2></div></div><p class="hint">Select a pod for its latest 200 log lines. Deployments can be scaled in edit mode.</p><div id="workloads" class="list empty">Choose a namespace to see workloads.</div></section>
-      <section class="panel"><div class="section-title"><div><p class="eyebrow">03 / SIGNALS</p><h2>Recent events</h2></div></div><div id="events" class="list empty">Choose a namespace to see events.</div></section>
+    <div id="investigation" hidden>
+      <section class="panel target-bar" aria-label="Investigation target">
+        <div class="target-heading">
+          <div><p class="eyebrow">CURRENT CONTEXT</p><h2 id="cluster-title">Selected cluster</h2></div>
+          <button id="change-cluster" class="secondary">Change cluster</button>
+        </div>
+      </section>
+      <nav id="investigation-tabs" class="tabs" role="tablist" aria-label="Troubleshooting views">
+        <button id="tab-overview" role="tab" aria-controls="panel-overview" aria-selected="true">Automated investigation</button>
+        <button id="tab-workloads" role="tab" aria-controls="panel-workloads" aria-selected="false" tabindex="-1">Manual investigation</button>
+      </nav>
+      <section id="panel-overview" class="panel cluster-scan" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+        <div class="cluster-scan-header">
+          <div><p class="eyebrow">CLUSTER INVESTIGATION</p><h2 id="overview-title">Cluster findings</h2></div>
+          <div class="cluster-scan-actions"><button id="scan" class="secondary" hidden>Rescan cluster</button><button id="ask-copilot" class="secondary" hidden>Investigate again</button></div>
+        </div>
+        <p class="hint">Copilot verifies findings from the read-only workload and node checks.</p>
+        <div class="scan-progress">
+          <p role="status" class="progress-status"><span class="status-indicator"><span id="ai-spinner" class="spinner" aria-hidden="true" hidden></span></span><strong>Copilot</strong><span id="ai-status">Select a cluster to start an investigation.</span></p>
+          <p role="status" class="progress-status"><span class="status-indicator"><span id="scan-spinner" class="spinner" aria-hidden="true" hidden></span><span id="scan-result-icon" class="result-icon" aria-hidden="true" hidden></span></span><strong>Cluster checks</strong><span id="scan-status">Select a cluster to start checks.</span></p>
+        </div>
+        <section id="copilot-findings" class="findings-group" aria-labelledby="copilot-findings-title" hidden>
+          <h3 id="copilot-findings-title">Copilot findings</h3>
+          <div id="ai-issues" class="issue-list"></div>
+        </section>
+        <section id="cluster-findings" class="findings-group" aria-labelledby="cluster-findings-title" hidden>
+          <div class="findings-header">
+            <h3 id="cluster-findings-title">Cluster checks</h3>
+            <label for="findings-filter">Filter cluster checks<input id="findings-filter" type="search" placeholder="Resource or namespace" aria-describedby="findings-filter-status"></label>
+          </div>
+          <p id="findings-filter-status" class="hint filter-status" role="status"></p>
+          <div id="issues" class="issue-list"></div>
+          <button id="show-more-issues" class="secondary" hidden>Show more signals</button>
+        </section>
+      </section>
+      <section id="panel-workloads" class="panel" role="tabpanel" aria-labelledby="tab-workloads" tabindex="0" hidden>
+        <p class="eyebrow">EXPLORE</p><h2>Manual investigation</h2>
+        <p class="hint">Ask about the whole cluster, or choose a namespace and inspect a resource.</p>
+        <section class="manual-section question-section">
+          <label for="cluster-question">Ask Copilot about this cluster</label>
+          <textarea id="cluster-question" maxlength="2000" rows="3" placeholder="Describe what you want to investigate" aria-describedby="cluster-question-note"></textarea>
+          <p id="cluster-question-note" class="hint">Your question is sent to Copilot. Do not include secrets or sensitive logs.</p>
+          <div class="actions"><button id="ask-cluster-question">Send to Copilot</button></div>
+          <p id="cluster-question-status" class="hint" role="status"></p>
+        </section>
+        <section class="manual-section">
+        <h3>Explore workloads</h3>
+        <p class="hint">Choose a namespace and inspect a deployment or pod for evidence, related resources and logs.</p>
+        <div id="namespace-controls" class="controls namespace-controls" hidden>
+          <label>Namespace<select id="namespace" disabled><option value="">Select a namespace</option></select></label>
+          <button id="refresh-namespaces" class="secondary">Refresh namespaces</button>
+          <button id="refresh" class="secondary" disabled>Refresh data</button>
+        </div>
+        <h3>Choose a pod or deployment</h3>
+        <p class="hint">Filter the workloads, then select one to open its investigation.</p>
+        <div class="controls">
+          <label>Resource type<select id="workload-kind"><option value="">All deployments and pods</option><option value="Deployment">Deployments</option><option value="Pod">Pods</option></select></label>
+          <label>Filter by name<input id="workload-filter" type="search" placeholder="Workload name"></label>
+        </div>
+        <p id="workload-status" class="hint" role="status">Choose a namespace to load workloads.</p>
+        <div class="controls workload-picker">
+          <label for="workload-select">Resource<select id="workload-select" disabled aria-describedby="workload-status"><option value="">Select a workload</option></select></label>
+          <button id="investigate-workload" disabled>Investigate resource</button>
+        </div>
+        <details class="workload-browser">
+          <summary>Browse workloads and status</summary>
+          <div id="workloads" class="list empty">Choose a namespace to see workloads.</div>
+        </details>
+        <h3>Signals in this namespace</h3>
+        <p id="namespace-issue-status" class="hint">Select a namespace to see workload signals.</p>
+        <div id="namespace-issues" class="issue-list" tabindex="0" aria-label="Namespace workload signals"></div>
+        </section>
+        <section id="panel-events" class="resource-card" aria-labelledby="events-title" hidden>
+          <p class="eyebrow">SIGNALS</p><h2 id="events-title">Recent events</h2>
+          <p class="hint">Up to 100 recent namespace events. Kubernetes events are ephemeral and are not a complete history.</p>
+          <div id="events" class="list empty">Choose a namespace to see events.</div>
+        </section>
+        <section id="panel-monitoring" class="resource-card" aria-labelledby="monitoring-title" hidden>
+          <p class="eyebrow">GO FURTHER</p><h2 id="monitoring-title">Monitoring &amp; tools</h2>
+          <p class="hint">Open your existing Azure monitoring and Grafana resources. History and trends depend on your configured data sources, permissions and retention.</p>
+          <div class="links"><a href="https://portal.azure.com/#browse/Microsoft.ContainerService%2FmanagedClusters" target="_blank" rel="noopener noreferrer">Azure portal: AKS clusters ↗</a><a href="https://learn.microsoft.com/azure/azure-monitor/containers/container-insights-overview" target="_blank" rel="noopener noreferrer">Container Insights ↗</a><a href="https://learn.microsoft.com/azure/azure-monitor/essentials/prometheus-metrics-overview" target="_blank" rel="noopener noreferrer">Managed Prometheus ↗</a><a href="https://learn.microsoft.com/azure/managed-grafana/" target="_blank" rel="noopener noreferrer">Azure Managed Grafana ↗</a></div>
+          <label for="grafana">Your Grafana dashboard URL</label><input id="grafana" type="url" placeholder="https://your-grafana.example/dashboard"><p class="hint">URLs are not saved. Do not include credentials or tokens.</p><a id="grafana-link" target="_blank" rel="noopener noreferrer" hidden>Open Grafana dashboard ↗</a><p class="hint">Direct metrics queries and charts are not yet implemented.</p>
+        </section>
+      </section>
+      <section id="panel-resource" class="panel" aria-labelledby="resource-title" tabindex="-1" hidden>
+        <div class="resource-header">
+          <div><p class="eyebrow">RESOURCE INVESTIGATION</p><h2 id="resource-title">Resource</h2></div>
+          <div class="resource-header-actions"><button id="resource-back" class="secondary">Back</button><button id="resource-refresh" class="secondary">Refresh investigation</button></div>
+        </div>
+        <div class="resource-metadata">
+          <div><span>Cluster</span><strong id="resource-cluster"></strong></div>
+          <div><span>Namespace</span><strong id="resource-namespace"></strong></div>
+          <div><span>State</span><strong id="resource-phase">Loading…</strong></div>
+          <div><span>Created</span><strong id="resource-created">Loading…</strong></div>
+        </div>
+        <section class="resource-card ai-summary">
+          <p class="eyebrow">COPILOT SUMMARY</p><h3>What’s happening?</h3>
+          <p role="status" class="hint progress-status"><span id="resource-ai-spinner" class="spinner" aria-hidden="true" hidden></span><span id="resource-ai-status">Preparing a focused Copilot investigation.</span></p>
+          <div id="resource-issues" class="issue-list"></div>
+          <div id="resource-manual-controls" hidden>
+            <label for="resource-question">Ask Copilot about this resource</label>
+            <textarea id="resource-question" maxlength="2000" rows="3" placeholder="Describe what you want to investigate" aria-describedby="resource-question-note"></textarea>
+            <p id="resource-question-note" class="hint">Your question is sent to Copilot. Do not include secrets or sensitive logs.</p>
+            <div class="actions"><button id="ask-resource-question">Send to Copilot</button></div>
+            <p id="resource-question-status" class="hint" role="status"></p>
+            <p class="hint">Refreshing reloads evidence and requests a new Copilot summary. Only limited status indicators are shared automatically; raw events and logs are not.</p>
+          </div>
+        </section>
+        <div class="detail-grid">
+          <section class="resource-card">
+            <h3>Resource evidence</h3><p id="resource-status" role="status" class="hint">Loading resource…</p><div id="resource-evidence" class="list"></div>
+          </section>
+          <section class="resource-card">
+            <h3>Resource events</h3><p class="hint">Recent events for this resource only. Events can contain sensitive data and may expire.</p><div id="resource-events" class="list"></div>
+          </section>
+        </div>
+        <section class="resource-card">
+          <h3>Related resources</h3><p class="hint">Explore owners, volume claims, CSI SecretProviderClass references and nodes where available. Secret values are not read.</p><div id="resource-related" class="related-list"></div>
+          <button id="resource-scale" class="secondary" hidden>Scale deployment</button>
+        </section>
+        <section class="resource-card">
+          <div class="section-title"><h3>kubectl describe</h3><button id="load-describe" class="secondary">Load describe</button></div>
+          <p class="hint">Describe output can contain sensitive values and is displayed locally. It is not automatically sent to Copilot.</p><pre id="describe-output">Not loaded.</pre>
+        </section>
+        <section id="pod-log-section" class="resource-card" hidden>
+          <div class="section-title"><h3>Pod logs</h3><label class="inline"><input type="checkbox" id="previous"> Previous container</label></div>
+          <p id="log-target" class="hint">Logs can contain sensitive data. Pending containers may not have logs yet.</p><button id="load-logs" class="secondary">Load logs</button><pre id="logs">Not loaded.</pre>
+        </section>
+      </section>
     </div>
-    <section class="panel"><div class="section-title"><div><p class="eyebrow">04 / EVIDENCE</p><h2>Pod logs</h2></div><label class="inline"><input type="checkbox" id="previous"> Previous container</label></div><p id="log-target" class="hint">Select a pod above. Logs can contain sensitive data.</p><pre id="logs">No logs loaded.</pre></section>
-    <div class="grid">
-      <section class="panel"><p class="eyebrow">05 / INVESTIGATE</p><h2>Findings</h2><p class="hint">Add evidence yourself or ask Copilot to add a finding. Nothing is saved until you choose Save.</p><ul id="findings"></ul><label for="finding">Finding</label><textarea id="finding" rows="3" maxlength="2000" placeholder="What did you observe? Include the evidence."></textarea><div class="actions"><button id="add-finding">Add finding</button><button id="save" class="secondary">Save privately</button><button id="history" class="secondary">View saved investigations</button></div><div id="history-list"></div></section>
-      <section class="panel"><p class="eyebrow">06 / GO FURTHER</p><h2>Monitoring &amp; tools</h2><p class="hint">Open your existing Azure monitoring and Grafana resources. History and trends depend on your configured data sources, permissions and retention.</p><div class="links"><a href="https://portal.azure.com/#browse/Microsoft.ContainerService%2FmanagedClusters" target="_blank" rel="noopener noreferrer">Azure portal: AKS clusters ↗</a><a href="https://learn.microsoft.com/azure/azure-monitor/containers/container-insights-overview" target="_blank" rel="noopener noreferrer">Container Insights ↗</a><a href="https://learn.microsoft.com/azure/azure-monitor/essentials/prometheus-metrics-overview" target="_blank" rel="noopener noreferrer">Managed Prometheus ↗</a><a href="https://learn.microsoft.com/azure/managed-grafana/" target="_blank" rel="noopener noreferrer">Azure Managed Grafana ↗</a></div><label for="grafana">Your Grafana dashboard URL</label><input id="grafana" type="url" placeholder="https://your-grafana.example/dashboard"><p class="hint">URLs are not saved. Do not include credentials or tokens.</p><a id="grafana-link" target="_blank" rel="noopener noreferrer" hidden>Open Grafana dashboard ↗</a><p class="hint">Direct metrics queries and charts are not yet implemented.</p></section>
-    </div>
-    <section class="panel danger"><div class="section-title"><div><p class="eyebrow">OPTIONAL / CHANGE CONTROL</p><h2>Editing mode</h2><p class="hint">Off by default and reset when the target changes. Scaling requires a separate confirmation; Kubernetes RBAC still applies. GitOps may revert manual changes.</p></div><button id="toggle-edit" class="secondary">Enable editing</button></div></section>
   </main>
+  <dialog id="edit-dialog" aria-labelledby="edit-dialog-title">
+    <h2 id="edit-dialog-title">Enable editing?</h2>
+    <p id="edit-target"></p>
+    <p>Changes affect the live cluster. Individual actions require confirmation, Kubernetes permissions still apply, and GitOps may revert changes.</p>
+    <div class="actions"><button id="confirm-edit">Enable editing</button><button id="cancel-edit" class="secondary">Stay read only</button></div>
+  </dialog>
   <footer>Built by <a href="https://pixelrobots.co.uk" target="_blank" rel="noopener noreferrer">Pixel Robots</a> · Evidence first. Changes deliberately.</footer>
 </body>
 </html>
