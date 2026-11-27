@@ -71,6 +71,8 @@ export function groupFindings(clusterFindings, copilotFindings, resources = []) 
         if (!existing.sources.includes(source)) existing.sources.push(source);
         if (issue.evidence && !existing.evidence.includes(issue.evidence)) existing.evidence.push(issue.evidence);
         if (issue.next && !existing.next.includes(issue.next)) existing.next.push(issue.next);
+        if (issue.diagnosis && !existing.diagnoses.includes(issue.diagnosis)) existing.diagnoses.push(issue.diagnosis);
+        for (const suggestion of issue.suggestions || []) if (!existing.suggestions.includes(suggestion)) existing.suggestions.push(suggestion);
         for (const doc of issue.docs || []) if (!existing.docs.includes(doc)) existing.docs.push(doc);
       } else {
         group.signals.push({
@@ -79,7 +81,9 @@ export function groupFindings(clusterFindings, copilotFindings, resources = []) 
           sources: [source],
           evidence: issue.evidence ? [issue.evidence] : [],
           next: issue.next ? [issue.next] : [],
-          docs: [...(issue.docs || [])]
+          docs: [...(issue.docs || [])],
+          diagnoses: issue.diagnosis ? [issue.diagnosis] : [],
+          suggestions: [...(issue.suggestions || [])]
         });
       }
     }

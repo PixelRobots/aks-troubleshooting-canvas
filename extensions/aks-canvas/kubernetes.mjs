@@ -30,11 +30,26 @@ const resourceKinds = {
   ReplicationController: 'replicationcontrollers', PersistentVolumeClaim: 'persistentvolumeclaims',
   SecretProviderClass: 'secretproviderclasses.secrets-store.csi.x-k8s.io', Node: 'nodes'
 };
+const discoveryKinds = {
+  pods: 'Pod', 'deployments.apps': 'Deployment', 'replicasets.apps': 'ReplicaSet',
+  'jobs.batch': 'Job', 'cronjobs.batch': 'CronJob', 'statefulsets.apps': 'StatefulSet',
+  'daemonsets.apps': 'DaemonSet', replicationcontrollers: 'ReplicationController',
+  persistentvolumeclaims: 'PersistentVolumeClaim', nodes: 'Node',
+  'secretproviderclasses.secrets-store.csi.x-k8s.io': 'SecretProviderClass'
+};
+const apiResourcePattern = /^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$/;
+function validateResourceType(type) {
+  if (!type || typeof type.resource !== 'string' || type.resource.length > 253 ||
+      !apiResourcePattern.test(type.resource) || typeof type.namespaced !== 'boolean') throw new Error('Invalid resource type.');
+  return type;
+}
 
-export function validateResourceTarget(target) {
-  if (!target || !Object.hasOwn(resourceKinds, target.kind)) throw new Error('Unsupported resource kind.');
+export function validateResourceTarget(target, discovered) {
+  if (!target || (!Object.hasOwn(resourceKinds, target.kind) && !discovered?.has(target.kind))) throw new Error('Unsupported resource kind.');
   resourceName(target.name, 'resource name');
-  if (target.kind !== 'Node' || target.namespace !== '') resourceName(target.namespace, 'namespace');
+  const namespaced = discovered?.get(target.kind)?.namespaced ?? target.kind !== 'Node';
+  if (namespaced) resourceName(target.namespace, 'namespace');
+  else if (target.namespace !== '') throw new Error('Cluster-scoped resources must not have a namespace.');
   return target;
 }
 
@@ -51,6 +66,14 @@ function projectResource(item, target) {
     for (const volume of item.spec?.volumes || []) {
       add('PersistentVolumeClaim', volume.persistentVolumeClaim?.claimName);
       if (volume.csi?.driver === 'secrets-store.csi.k8s.io') add('SecretProviderClass', volume.csi.volumeAttributes?.secretProviderClass);
+    }
+  }
+  const secretProviderObjects = [];
+  if (target.kind === 'SecretProviderClass' && typeof item.spec?.parameters?.objects === 'string') {
+    const matches = item.spec.parameters.objects.matchAll(/\bobjectName\s*:\s*["']?([A-Za-z0-9][A-Za-z0-9._-]{0,126})["']?/g);
+    for (const match of matches) {
+      if (!secretProviderObjects.includes(match[1])) secretProviderObjects.push(match[1]);
+      if (secretProviderObjects.length === 20) break;
     }
   }
   const conditions = (item.status?.conditions || []).map(condition => ({
@@ -71,11 +94,19 @@ function projectResource(item, target) {
     created: item.metadata.creationTimestamp, phase: item.status?.phase,
     conditions, containers, related,
     provider: target.kind === 'SecretProviderClass' ? item.spec?.provider : undefined,
+    keyVaultName: target.kind === 'SecretProviderClass' && typeof item.spec?.parameters?.keyvaultName === 'string' &&
+      /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/.test(item.spec.parameters.keyvaultName)
+      ? item.spec.parameters.keyvaultName
+      : undefined,
+    secretProviderObjects: secretProviderObjects.length ? secretProviderObjects : undefined,
     schedule: target.kind === 'CronJob' ? item.spec?.schedule : undefined,
     suspended: target.kind === 'CronJob' ? item.spec?.suspend : undefined,
     activeJobs: target.kind === 'CronJob' && Array.isArray(item.status?.active) ? item.status.active.length : undefined,
     lastScheduleTime: target.kind === 'CronJob' ? item.status?.lastScheduleTime : undefined,
     lastSuccessfulTime: target.kind === 'CronJob' ? item.status?.lastSuccessfulTime : undefined,
+    jobActive: target.kind === 'Job' ? item.status?.active : undefined,
+    jobSucceeded: target.kind === 'Job' ? item.status?.succeeded : undefined,
+    jobFailed: target.kind === 'Job' ? item.status?.failed : undefined,
     selector: target.kind === 'Deployment' ? item.spec?.selector : undefined,
     desired: target.kind === 'Deployment' ? (item.spec?.replicas ?? 1) : undefined,
     available: target.kind === 'Deployment' ? (item.status?.availableReplicas || 0) : undefined
@@ -157,6 +188,31 @@ export function createKubernetes(run = async args => {
     async namespaces(context) {
       const result = await json([...contextArgs(context), 'get', 'namespaces', '-o', 'json']);
       return result.items.map(item => item.metadata.name);
+    },
+    async resourceTypes(context) {
+      const results = await Promise.all([true, false].map(async namespaced => {
+        const output = await run([...contextArgs(context), 'api-resources', '--verbs=list,get', `--namespaced=${namespaced}`, '-o', 'name']);
+        return output.split(/\r?\n/).map(value => value.trim()).filter(Boolean).map(resource => {
+          if (resource.length > 253 || !apiResourcePattern.test(resource)) throw new Error('Kubernetes returned an invalid resource type.');
+          return { resource, kind: discoveryKinds[resource] || resource, namespaced };
+        });
+      }));
+      return results.flat().sort((a, b) => a.resource.localeCompare(b.resource));
+    },
+    async resourceNames(context, type, namespace) {
+      validateResourceType(type);
+      const scope = type.namespaced ? ['-n', resourceName(namespace, 'namespace')] : [];
+      const output = await run([...contextArgs(context), ...scope, 'get', type.resource, '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}']);
+      return output.split(/\r?\n/).filter(Boolean).map(name => resourceName(name, 'resource name'));
+    },
+    async resourceMetadata(context, type, target) {
+      validateResourceType(type);
+      const scope = type.namespaced ? ['-n', resourceName(target.namespace, 'namespace')] : [];
+      resourceName(target.name, 'resource name');
+      const output = await run([...contextArgs(context), ...scope, 'get', type.resource, target.name, '-o', 'jsonpath={.metadata.uid}{"\\t"}{.metadata.creationTimestamp}']);
+      const [uid, created] = output.split('\t');
+      if (!uid || !/^[a-z0-9-]{1,128}$/i.test(uid)) throw new Error('Kubernetes returned an invalid resource UID.');
+      return { kind: target.kind, name: target.name, namespace: target.namespace, uid, created, conditions: [], containers: [], related: [], metadataOnly: true };
     },
     async workloads(context, namespace) {
       const result = await json([...contextArgs(context), '-n', resourceName(namespace, 'namespace'), 'get', 'deployments,pods', '-o', 'json']);

@@ -48,7 +48,7 @@
         <p class="hint">Findings are grouped by workload where possible. Copilot reviews scan signals; causes need confirmation. Rescan updates checks; Investigate again requests a new Copilot review.</p>
         <div class="scan-progress">
           <p id="ai-progress" role="status" class="progress-status"><span class="status-indicator"><span id="ai-spinner" class="spinner" aria-hidden="true" hidden></span></span><strong>Copilot</strong><span id="ai-status">Select a cluster to start an investigation.</span></p>
-          <p role="status" class="progress-status"><span class="status-indicator"><span id="scan-spinner" class="spinner" aria-hidden="true" hidden></span><span id="scan-result-icon" class="result-icon" aria-hidden="true" hidden></span></span><strong>Cluster checks</strong><span id="scan-status">Select a cluster to start checks.</span></p>
+          <p id="scan-progress" role="status" class="progress-status"><span class="status-indicator"><span id="scan-spinner" class="spinner" aria-hidden="true" hidden></span><span id="scan-result-icon" class="result-icon" aria-hidden="true" hidden></span></span><strong>Cluster checks</strong><span id="scan-status">Select a cluster to start checks.</span></p>
         </div>
         <section id="cluster-findings" class="findings-group" aria-labelledby="cluster-findings-title" hidden>
           <div class="findings-header">
@@ -62,35 +62,48 @@
       </section>
       <section id="panel-workloads" class="panel" role="tabpanel" aria-labelledby="tab-workloads" tabindex="0" hidden>
         <p class="eyebrow">EXPLORE</p><h2>Manual investigation</h2>
-        <p class="hint">Ask about the whole cluster, or choose a namespace and inspect a resource.</p>
+        <p class="hint">Ask about the cluster, or use the visual explorer to open a resource diagnosis.</p>
         <section class="manual-section question-section">
           <label for="cluster-question">Ask Copilot about this cluster</label>
+          <div id="cluster-conversation" class="conversation" aria-live="polite"></div>
           <textarea id="cluster-question" maxlength="2000" rows="3" placeholder="Describe what you want to investigate" aria-describedby="cluster-question-note"></textarea>
-          <p id="cluster-question-note" class="hint">Your question is sent to Copilot. Do not include secrets or sensitive logs.</p>
-          <div class="actions"><button id="ask-cluster-question">Send to Copilot</button></div>
+          <p id="cluster-question-note" class="hint">Questions and answers are stored in the Copilot session. Do not include secrets or sensitive logs. Responses use the latest scan signals.</p>
+          <div class="actions"><button id="ask-cluster-question">Ask Copilot</button></div>
           <p id="cluster-question-status" class="hint" role="status"></p>
         </section>
         <section class="manual-section">
-        <h3>Explore workloads</h3>
+        <div class="section-title"><div><p class="eyebrow">RESOURCE INVENTORY</p><h3>Find a resource</h3></div><button id="refresh-namespaced-inventory" class="secondary">Refresh</button></div>
         <div id="namespace-controls" class="controls namespace-controls" hidden>
           <label>Namespace<select id="namespace" disabled><option value="">Select a namespace</option></select></label>
           <button id="refresh-namespaces" class="secondary">Refresh namespaces</button>
           <button id="refresh" class="secondary" disabled>Refresh data</button>
         </div>
-        <h3>Choose a pod or deployment</h3>
-        <div class="controls">
-          <label>Resource type<select id="workload-kind"><option value="">All deployments and pods</option><option value="Deployment">Deployments</option><option value="Pod">Pods</option></select></label>
-          <label>Filter by name<input id="workload-filter" type="search" placeholder="Workload name"></label>
+        <p class="hint">Choose a namespace, filter the inventory, and open the resource you need. Status comes from the latest read and may change.</p>
+        <div id="resource-kind-shortcuts" class="resource-kind-shortcuts" aria-label="Common resource types"></div>
+        <div class="resource-browser-toolbar">
+          <label class="resource-search">Search resources<input id="explorer-filter" type="search" placeholder="Filter by resource name" disabled></label>
+          <button id="explorer-problems-toggle" class="secondary" aria-pressed="false">Problems only</button>
         </div>
-        <p id="workload-status" class="hint" role="status">Choose a namespace to load workloads.</p>
-        <div class="controls workload-picker">
-          <label for="workload-select">Resource<select id="workload-select" disabled aria-describedby="workload-status"><option value="">Select a workload</option></select></label>
-          <button id="investigate-workload" disabled>Investigate resource</button>
-        </div>
-        <details class="workload-browser">
-          <summary>Browse workloads and status</summary>
-          <div id="workloads" class="list empty">Choose a namespace to see workloads.</div>
+        <p id="explorer-status" class="hint" role="status">Select a resource type.</p>
+        <div id="explorer-resource-grid" class="resource-browser-grid inventory-grid" aria-live="polite"></div>
+        <details class="advanced-resource-types">
+          <summary>All API resource types</summary>
+          <p class="hint">Use this for cluster-scoped resources and custom resources. These may support metadata-only investigation.</p>
+          <div class="controls"><label>Resource type<select id="explorer-type" disabled><option value="">Loading resource types…</option></select></label><button id="refresh-resource-types" class="secondary">Refresh types</button></div>
         </details>
+        <div class="legacy-resource-picker" hidden>
+          <label for="explorer-select">Resource<select id="explorer-select" disabled><option value="">Select a resource</option></select></label>
+          <button id="explorer-refresh" class="secondary" disabled>Refresh resources</button>
+          <button id="explorer-investigate" disabled>Investigate resource</button>
+        </div>
+        <div hidden>
+          <select id="workload-kind"><option value="">All</option><option value="Deployment">Deployments</option><option value="Pod">Pods</option></select>
+          <input id="workload-filter" type="search">
+          <p id="workload-status"></p>
+          <select id="workload-select"><option value="">Select a workload</option></select>
+          <button id="investigate-workload">Investigate resource</button>
+          <div id="workloads"></div>
+        </div>
         <h3>Signals in this namespace</h3>
         <p id="namespace-issue-status" class="hint">Select a namespace to see workload signals.</p>
         <div id="namespace-issues" class="issue-list" tabindex="0" aria-label="Namespace workload signals"></div>
@@ -112,53 +125,64 @@
           <div><p class="eyebrow">RESOURCE INVESTIGATION</p><h2 id="resource-title">Resource</h2></div>
           <div class="resource-header-actions"><button id="resource-back" class="secondary">Back</button><button id="resource-refresh" class="secondary">Refresh investigation</button></div>
         </div>
-        <div class="resource-metadata">
+        <div class="resource-metadata compact-metadata">
           <div><span>Cluster</span><strong id="resource-cluster"></strong></div>
           <div><span>Namespace</span><strong id="resource-namespace"></strong></div>
           <div><span id="resource-phase-label">State</span><strong id="resource-phase">Loading…</strong></div>
           <div id="resource-pod-summary" hidden><span>Affected pods (scan)</span><strong id="resource-pod-phases"></strong></div>
-          <div><span>Created</span><strong id="resource-created">Loading…</strong></div>
+          <div><span>Age</span><strong id="resource-created">Loading…</strong></div>
         </div>
         <section class="resource-card ai-summary">
-          <p class="eyebrow">COPILOT SUMMARY</p><h3>What’s happening?</h3>
+          <p class="eyebrow">AUTOMATIC AI DIAGNOSIS</p><h3>What’s happening?</h3>
           <p id="resource-ai-progress" role="status" class="hint progress-status"><span id="resource-ai-spinner" class="spinner" aria-hidden="true" hidden></span><span id="resource-ai-status">Preparing a focused Copilot investigation.</span></p>
           <p id="resource-summary-age" class="summary-age hint" hidden></p>
           <div id="resource-summary" class="resource-summary"></div>
+          <details id="resource-activity" class="investigation-activity" hidden>
+            <summary id="resource-activity-summary">Investigation activity</summary>
+            <ol id="resource-activity-list"></ol>
+          </details>
           <div id="resource-issues" class="issue-list"></div>
+          <p id="resource-scan-status" class="hint" role="status"></p>
+          <details id="resource-scan-details" class="resource-scan-details" open>
+            <summary>Cluster-check findings</summary>
+            <p class="hint">Signals from the latest scan may be out of date. Open an affected resource to inspect its current status and events.</p>
+            <div id="resource-scan-issues" class="issue-list"></div>
+          </details>
           <div id="resource-manual-controls" hidden>
             <label for="resource-question">Ask Copilot about this resource</label>
+            <div id="resource-conversation" class="conversation" aria-live="polite"></div>
             <textarea id="resource-question" maxlength="2000" rows="3" placeholder="Describe what you want to investigate" aria-describedby="resource-question-note"></textarea>
-            <p id="resource-question-note" class="hint">Your question is sent to Copilot. Do not include secrets or sensitive logs.</p>
-            <div class="actions"><button id="ask-resource-question">Send to Copilot</button></div>
+            <p id="resource-question-note" class="hint">Questions and answers are stored in the Copilot session. Do not include secrets or sensitive logs.</p>
+            <div class="actions"><button id="ask-resource-question">Ask Copilot</button></div>
             <p id="resource-question-status" class="hint" role="status"></p>
           </div>
         </section>
-        <section class="resource-card">
-          <h3>Cluster-check findings</h3>
-          <p class="hint">Signals from the latest scan may be out of date. Open an affected resource to inspect its current status and events.</p>
-          <p id="resource-scan-status" class="hint" role="status"></p>
-          <div id="resource-scan-issues" class="issue-list"></div>
-        </section>
-        <div class="detail-grid">
-          <section class="resource-card">
-            <h3>Resource evidence</h3><p id="resource-status" role="status" class="hint">Loading resource…</p><div id="resource-evidence" class="list"></div>
+        <details class="resource-inspector">
+          <summary>Inspect supporting evidence</summary>
+          <div class="resource-inspector-toolbar">
+            <span>Read-only evidence loaded by this investigation. Raw content stays local and may contain sensitive data.</span>
+            <button id="resource-scale" class="secondary" hidden>Scale deployment</button>
+          </div>
+          <nav class="inspector-tabs" aria-label="Supporting evidence views">
+            <button data-inspector-tab="overview">Status</button>
+            <button data-inspector-tab="events">Events</button>
+            <button data-inspector-tab="related">Related resources</button>
+            <button data-inspector-tab="describe">Describe</button>
+            <button data-inspector-tab="logs" id="logs-inspector-tab">Logs</button>
+          </nav>
+          <section data-inspector-panel="overview" class="inspector-panel">
+            <p id="resource-status" role="status" class="hint">Loading resource…</p><div id="resource-evidence" class="list"></div>
           </section>
-          <section class="resource-card">
-            <h3>Resource events</h3><p class="hint">Recent events for this resource only. Events can contain sensitive data and may expire.</p><div id="resource-events" class="list"></div>
+          <section data-inspector-panel="events" class="inspector-panel" hidden><div id="resource-events" class="list"></div></section>
+          <section data-inspector-panel="related" class="inspector-panel" hidden><div id="resource-related" class="related-list"></div></section>
+          <section id="describe-section" data-inspector-panel="describe" class="inspector-panel" hidden>
+            <div class="actions"><button id="load-describe" class="secondary">Load describe</button></div><pre id="describe-output">Not loaded.</pre>
           </section>
-        </div>
-        <section class="resource-card">
-          <h3>Related resources</h3><p class="hint">Owners, nodes, volume claims and CSI SecretProviderClass references are shown when available. Pod references come from the scan and may be incomplete; they do not establish a cause. Secret values are not read.</p><div id="resource-related" class="related-list"></div>
-          <button id="resource-scale" class="secondary" hidden>Scale deployment</button>
-        </section>
-        <section class="resource-card">
-          <div class="section-title"><h3>kubectl describe</h3><button id="load-describe" class="secondary">Load describe</button></div>
-          <p class="hint">Describe output can contain sensitive values and is displayed locally. It is not automatically sent to Copilot.</p><pre id="describe-output">Not loaded.</pre>
-        </section>
-        <section id="pod-log-section" class="resource-card" hidden>
-          <div class="section-title"><h3>Pod logs</h3><label class="inline"><input type="checkbox" id="previous"> Previous container</label></div>
-          <p id="log-target" class="hint">Logs can contain sensitive data. Pending containers may not have logs yet.</p><button id="load-logs" class="secondary">Load logs</button><pre id="logs">Not loaded.</pre>
-        </section>
+          <section id="pod-log-section" data-inspector-panel="logs" class="inspector-panel" hidden>
+            <div class="section-title"><p id="log-target" class="hint">Logs can contain sensitive data.</p><label class="inline"><input type="checkbox" id="previous"> Previous container</label></div>
+            <div class="actions"><button id="load-logs" class="secondary">Load logs</button></div><pre id="logs">Not loaded.</pre>
+          </section>
+        </details>
       </section>
     </div>
   </main>

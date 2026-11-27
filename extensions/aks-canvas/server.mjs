@@ -47,6 +47,7 @@ const eventDetails = {
 
 function summarizeResourceEvidence(details, events, eventError) {
   const signals = new Set();
+  if (details.metadataOnly) signals.add('Only resource metadata was collected; configuration, status and health are unknown.');
   if (details.kind === 'Pod' && details.phase === 'Pending') signals.add('Pod phase is Pending.');
   if (details.kind === 'Deployment' && details.desired === 0) signals.add('The deployment has zero desired replicas; whether this is intentional is unknown.');
   if (details.kind === 'Deployment' && Number.isSafeInteger(details.desired) && details.desired >= 0 &&
@@ -60,6 +61,11 @@ function summarizeResourceEvidence(details, events, eventError) {
     for (const [field, label] of [['lastScheduleTime', 'last scheduled'], ['lastSuccessfulTime', 'last successful']]) {
       const time = typeof details[field] === 'string' ? Date.parse(details[field]) : NaN;
       if (Number.isFinite(time)) signals.add(`The CronJob reports its ${label} time as ${new Date(time).toISOString()}; the timestamp is unverified.`);
+    }
+  }
+  if (details.kind === 'Job') {
+    for (const [field, label] of [['jobActive', 'active'], ['jobSucceeded', 'succeeded'], ['jobFailed', 'failed']]) {
+      if (Number.isSafeInteger(details[field]) && details[field] >= 0) signals.add(`The Job reports ${details[field]} ${label} pods.`);
     }
   }
   for (const condition of details.conditions || []) {
@@ -123,6 +129,14 @@ function summarizeResourceEvidence(details, events, eventError) {
           correlatedEvents.set(key, { reason: event.reason, labels, time, count: event.count });
         }
       }
+      if (event.reason === 'FailedMount' && typeof event.message === 'string') {
+        const references = [...event.message.matchAll(/https:\/\/([a-z0-9](?:[-a-z0-9]*[a-z0-9])?)\.vault\.azure\.net\/secrets\/([A-Za-z0-9][A-Za-z0-9._-]{0,126})\/?/gi)];
+        for (const [, vault, object] of references.slice(0, 3)) {
+          signals.add(`A returned FailedMount event references Key Vault "${vault}" and object "${object}"; this is event text, not independent verification.`);
+        }
+        const status = event.message.match(/\b(?:HTTP|status(?:code)?)[^0-9]{0,8}(403|404)\b/i);
+        if (status) signals.add(`A returned FailedMount event includes HTTP ${status[1]}; its current relevance is unverified.`);
+      }
     }
   }
   for (const [reason, time] of eventTimes) {
@@ -161,15 +175,52 @@ function summarizeLogs(logs) {
     .map(([, label]) => `A log contains text matching "${label}"; its context and cause are unverified.`);
 }
 
+function diagnosticTimestamp() {
+  return new Intl.DateTimeFormat('en-GB', {
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hourCycle: 'h23', timeZone: 'UTC'
+  }).format(new Date());
+}
+
+function decorateDiagnostic(context, summary, signals) {
+  const times = signals.flatMap(signal =>
+    [...signal.matchAll(/\blast-observed time is (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)/g)].map(match => match[1])
+  ).filter(value => Number.isFinite(Date.parse(value))).sort();
+  const eventLastSeen = times.length ? new Intl.DateTimeFormat('en-GB', {
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hourCycle: 'h23', timeZone: 'UTC'
+  }).format(new Date(times.at(-1))) : 'Unavailable';
+  const heading = `Cluster: ${context} · Analyzed: ${diagnosticTimestamp()} UTC · Event last seen: ${eventLastSeen}${times.length ? ' UTC (reported)' : ''}`;
+  return `${heading}\n\n${summary}`;
+}
+
+function investigationActivity(signals) {
+  const activity = [];
+  activity.push('Read or attempted to read the selected resource status and current events');
+  const pods = new Set(signals.flatMap(signal => [...signal.matchAll(/Related pod (\d+):/g)].map(match => match[1])));
+  for (const pod of [...pods].sort((a, b) => Number(a) - Number(b))) activity.push(`Read related pod ${pod} status and events`);
+  if (signals.some(signal => /Pod \d+ .*logs:/i.test(signal))) activity.push('Checked available current and previous pod log indicators');
+  if (signals.some(signal => /related SecretProviderClass/i.test(signal))) activity.push('Read the referenced SecretProviderClass safely and projected provider, vault and object names');
+  if (signals.some(signal => /related PersistentVolumeClaim/i.test(signal))) activity.push('Read referenced PVC phase');
+  if (signals.some(signal => /related Node/i.test(signal))) activity.push('Read referenced node readiness');
+  if (signals.some(signal => /Related Job \d+:/i.test(signal))) activity.push('Read related Job outcomes');
+  return activity;
+}
+
 export async function createInstance({ kubernetes = createKubernetes(), askCopilot, askResourceCopilot, askManualCopilot, checkNodes = checkDeallocatedNodes } = {}) {
-  const state = { context: '', namespace: '', aiIssues: [], resourceSummaries: [], editing: false };
+  const state = { context: '', namespace: '', aiIssues: [], resourceSummaries: [], conversations: [], editing: false };
   const resourceEvidence = new Map();
   let scanSnapshot = { resources: [], issues: [], errors: [] };
   let targetGeneration = 0;
   const summaryRequests = new Map();
+  let reviewRequest = 0;
+  let discoveredTypes = new Map();
+  let discoveryGeneration = 0;
   const evidenceKey = (context, resource) => JSON.stringify([context, resource.namespace, resource.kind, resource.name]);
   const token = randomBytes(32).toString('hex');
-  const getContext = () => ({ ...state, aiIssues: [...state.aiIssues], resourceSummaries: [...state.resourceSummaries] });
+  const getContext = () => ({ ...state, aiIssues: [...state.aiIssues], resourceSummaries: [...state.resourceSummaries], conversations: [...state.conversations] });
   const relatedPods = target => {
     if (target.kind === 'Pod') return [target];
     const key = item => JSON.stringify([item.namespace, item.kind, item.name]);
@@ -193,33 +244,59 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
       .sort((a, b) => Number(affected.has(key(b))) - Number(affected.has(key(a))));
   };
   const collectResourceSignals = async (context, target, saved) => {
-    const signals = [...(saved?.signals || ['Resource evidence was not available; do not assume the resource is healthy.'])];
+    const generation = targetGeneration;
+    const assertTarget = () => {
+      if (generation !== targetGeneration || state.context !== context) throw new Error('The selected context or namespace changed during evidence collection.');
+    };
+    let root = saved;
+    if (!root) {
+      try {
+        const details = await kubernetes.resource(context, target);
+        assertTarget();
+        let events = [];
+        let eventError;
+        try { events = await kubernetes.resourceEvents(context, target, details.uid); }
+        catch (error) { eventError = error.message; }
+        root = { details, signals: summarizeResourceEvidence(details, events, eventError) };
+      } catch {
+        assertTarget();
+        root = { signals: ['Current resource evidence could not be read; do not assume the resource is healthy.'] };
+      }
+    }
+    const signals = [...root.signals];
     const pods = relatedPods(target);
+    const references = [...(root.details?.related || [])];
     if (target.kind !== 'Pod' && !pods.length) {
       signals.push('No related pods were identified in the scan; ownership data may be incomplete.');
     }
     if (pods.length > 3) signals.push(`Only 3 of ${pods.length} related pods were sampled.`);
     for (const [index, pod] of pods.slice(0, 3).entries()) {
-      let details = target.kind === 'Pod' ? saved?.details : undefined;
+      assertTarget();
+      let details = target.kind === 'Pod' ? root.details : undefined;
       if (!details) {
         try {
           details = await kubernetes.resource(context, pod);
+          assertTarget();
           let events = [];
           let eventError;
           try { events = await kubernetes.resourceEvents(context, pod, details.uid); }
           catch (error) { eventError = error.message; }
           signals.push(...summarizeResourceEvidence(details, events, eventError).map(signal => `Related pod ${index + 1}: ${signal}`));
         } catch {
+          assertTarget();
           signals.push(`Related pod ${index + 1} status or events could not be read; evidence is incomplete.`);
           continue;
         }
       }
+      assertTarget();
+      references.push(...(details?.related || []));
       if (!kubernetes.logs) {
         signals.push(`Pod ${index + 1} logs were unavailable; log evidence is incomplete.`);
         continue;
       }
       const previousSelections = [false, ...(details?.containers?.some(container => container.restarts > 0) ? [true] : [])];
       for (const previous of previousSelections) {
+        assertTarget();
         try {
           const logs = await kubernetes.logs(context, pod.namespace, pod.name, previous);
           const extracted = summarizeLogs(logs);
@@ -230,7 +307,75 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
         }
       }
     }
+    assertTarget();
+    const seen = new Set();
+    const checks = references.filter(reference => {
+      if (!['PersistentVolumeClaim', 'SecretProviderClass', 'Node'].includes(reference.kind)) return false;
+      const key = `${reference.kind}:${reference.name}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (checks.length > 3) signals.push(`Only 3 of ${checks.length} related storage or node references were checked.`);
+    for (const [index, reference] of checks.slice(0, 3).entries()) {
+      assertTarget();
+      const related = { ...reference, namespace: reference.kind === 'Node' ? '' : target.namespace };
+      try {
+        const details = await kubernetes.resource(context, related);
+        assertTarget();
+        const label = `Related ${reference.kind} ${index + 1}`;
+        if (reference.kind === 'PersistentVolumeClaim') {
+          signals.push(['Pending', 'Bound', 'Lost'].includes(details.phase)
+            ? `${label} reports phase ${details.phase}.`
+            : `${label} phase was not reported; this check is incomplete.`);
+        } else if (reference.kind === 'SecretProviderClass') {
+          signals.push(`${label} was readable; its object configuration and access were not verified.`);
+          if (details.provider === 'azure') signals.push(`${label} reports the Azure provider.`);
+          if (details.keyVaultName) signals.push(`${label} references Key Vault name "${details.keyVaultName}"; the vault was not queried.`);
+          if (details.secretProviderObjects?.length) signals.push(`${label} references object ${details.secretProviderObjects.map(name => `"${name}"`).join(', ')}; these are object names, not values, and existence was not verified.`);
+        } else if (reference.kind === 'Node') {
+          const ready = (details.conditions || []).find(condition => condition.type === 'Ready');
+          signals.push(['True', 'False', 'Unknown'].includes(ready?.status)
+            ? `${label} reports Ready ${ready.status}.`
+            : `${label} Ready condition was not reported; this check is incomplete.`);
+        }
+      } catch {
+        assertTarget();
+        signals.push(`A related ${reference.kind} could not be read; this check is incomplete.`);
+      }
+    }
+    if (target.kind === 'CronJob') {
+      const jobs = scanSnapshot.resources.filter(resource => resource.kind === 'Job' && resource.namespace === target.namespace &&
+        resource.owners?.some(owner => owner.kind === target.kind && owner.name === target.name));
+      if (!jobs.length) signals.push('No related Jobs were identified in the scan; ownership data may be incomplete.');
+      else signals.push('Related Jobs were identified from the scan; their current ownership was not reverified.');
+      if (jobs.length > 3) signals.push(`Only 3 of ${jobs.length} related Jobs from the scan were checked.`);
+      for (const [index, job] of jobs.slice(0, 3).entries()) {
+        assertTarget();
+        try {
+          const details = await kubernetes.resource(context, job);
+          assertTarget();
+          const jobSignals = summarizeResourceEvidence(details, [], undefined);
+          signals.push(...jobSignals.map(signal => `Related Job ${index + 1}: ${signal}`));
+        } catch {
+          assertTarget();
+          signals.push(`Related Job ${index + 1} could not be read; this check is incomplete.`);
+        }
+      }
+    }
     return signals;
+  };
+  const conversationFor = target => state.conversations.find(item =>
+    item.context === state.context && item.kind === (target?.kind || '') &&
+    item.name === (target?.name || '') && item.namespace === (target?.namespace || ''));
+  const appendConversation = (target, question, answer) => {
+    let conversation = conversationFor(target);
+    if (!conversation) {
+      conversation = { context: state.context, kind: target?.kind || '', name: target?.name || '', namespace: target?.namespace || '', messages: [] };
+      state.conversations.push(conversation);
+    }
+    conversation.messages.push({ role: 'user', content: question }, { role: 'assistant', content: answer });
+    if (conversation.messages.length > 20) conversation.messages.splice(0, conversation.messages.length - 20);
   };
   const validateIssue = issue => {
     if (!issue || issue.context !== state.context || !state.context) throw new Error('The selected context has changed.');
@@ -246,8 +391,18 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
       }
     })) throw new Error('Documentation links must be HTTPS links to Microsoft Learn or kubernetes.io.');
     const hasResource = issue.kind !== undefined || issue.name !== undefined || issue.namespace !== undefined;
-    if (hasResource) validateResourceTarget(issue);
-    return { title: issue.title, evidence: issue.evidence, next: issue.next, docs: issue.docs, ...(hasResource ? { kind: issue.kind, name: issue.name, namespace: issue.namespace } : {}) };
+    if (hasResource) validateResourceTarget(issue, discoveredTypes);
+    const diagnosis = issue.diagnosis === undefined ? undefined : issue.diagnosis;
+    if (diagnosis !== undefined && (typeof diagnosis !== 'string' || diagnosis.length > 12000)) throw new Error('Invalid issue diagnosis.');
+    const suggestions = issue.suggestions === undefined ? undefined : issue.suggestions;
+    if (suggestions !== undefined && (!Array.isArray(suggestions) || suggestions.length > 3 ||
+        !suggestions.every(value => typeof value === 'string' && value.trim() && value.length <= 160))) throw new Error('Invalid issue suggestions.');
+    return {
+      title: issue.title, evidence: issue.evidence, next: issue.next, docs: issue.docs,
+      ...(diagnosis !== undefined ? { diagnosis } : {}),
+      ...(suggestions !== undefined ? { suggestions } : {}),
+      ...(hasResource ? { kind: issue.kind, name: issue.name, namespace: issue.namespace } : {})
+    };
   };
   const saveIssue = saved => {
     const existing = state.aiIssues.findIndex(item =>
@@ -304,12 +459,12 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Invalid request.');
       const target = () => {
-        const clusterNode = body.kind === 'Node' && body.namespace === '';
+        const clusterResource = (body.kind === 'Node' || discoveredTypes.get(body.kind)?.namespaced === false) && body.namespace === '';
         if (body.context !== state.context || !state.context ||
-            (!clusterNode && (body.namespace !== state.namespace || !state.namespace))) {
+            (!clusterResource && (body.namespace !== state.namespace || !state.namespace))) {
           throw new Error('The selected context or namespace has changed.');
         }
-        return validateResourceTarget({ kind: body.kind, name: body.name, namespace: body.namespace });
+        return validateResourceTarget({ kind: body.kind, name: body.name, namespace: body.namespace }, discoveredTypes);
       };
       let result;
       switch (route) {
@@ -326,7 +481,11 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
             state.namespace = '';
             state.aiIssues = [];
             state.resourceSummaries = [];
+            state.conversations = [];
+            reviewRequest++;
             state.editing = false;
+            discoveredTypes = new Map();
+            discoveryGeneration++;
             resourceEvidence.clear();
             scanSnapshot = { resources: [], issues: [], errors: [] };
             targetGeneration++;
@@ -337,6 +496,29 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
           if (!state.context) throw new Error('Select a context first.');
           result = await kubernetes.namespaces(state.context);
           break;
+        case '/api/resource-types': {
+          if (!state.context) throw new Error('Select a context first.');
+          const context = state.context;
+          const generation = ++discoveryGeneration;
+          const types = await kubernetes.resourceTypes(context);
+          if (state.context !== context) throw new Error('The context changed during resource discovery.');
+          if (generation !== discoveryGeneration) throw new Error('A newer resource discovery replaced this request.');
+          discoveredTypes = new Map(types.map(type => [type.kind, type]));
+          result = types;
+          break;
+        }
+        case '/api/resource-names': {
+          if (!state.context || body.context !== state.context) throw new Error('The context changed; select a resource type again.');
+          const type = discoveredTypes.get(body.kind);
+          if (!type) throw new Error('Select an available resource type.');
+          const context = state.context;
+          const namespace = type.namespaced ? state.namespace : '';
+          if (type.namespaced && (!namespace || body.namespace !== namespace)) throw new Error('Select a namespace first.');
+          const names = await kubernetes.resourceNames(context, type, namespace);
+          if (context !== state.context || (type.namespaced && namespace !== state.namespace)) throw new Error('The selected context or namespace changed while loading resources.');
+          result = names;
+          break;
+        }
         case '/api/scan': {
           if (!state.context) throw new Error('Select a context first.');
           const context = state.context;
@@ -392,7 +574,39 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
               kind: issue.kind, name: issue.name, namespace: issue.namespace
             };
           });
-          await askCopilot(state.context, findings, body.scanErrors || []);
+          {
+            const context = state.context;
+            const request = ++reviewRequest;
+            const candidates = findings.map((finding, index) => {
+              const text = `${finding.title} ${finding.evidence}`.toLowerCase();
+              const score = (text.includes('failedmount') ? 100 : 0) +
+                (text.includes('crashloopbackoff') ? 90 : 0) +
+                (text.includes('failedscheduling') ? 80 : 0) +
+                (text.includes('unhealthy') ? 70 : 0) +
+                (text.includes('backoff') ? 60 : 0) +
+                (text.includes('pending') ? 40 : 0);
+              return { finding, index, score };
+            }).sort((left, right) => right.score - left.score).slice(0, 6);
+            const detailedEvidence = (await Promise.all(candidates.map(async ({ finding, index }) => {
+              const signals = await collectResourceSignals(context, finding, resourceEvidence.get(evidenceKey(context, finding)));
+              return { index, signals };
+            }))).filter(Boolean);
+            if (context !== state.context) throw new Error('The context changed during automatic evidence collection.');
+            const reviewed = await askCopilot(context, findings, body.scanErrors || [], detailedEvidence);
+            if (context !== state.context) throw new Error('The context changed during the scan review.');
+            if (request !== reviewRequest) throw new Error('A newer scan review replaced this request.');
+            if (!Array.isArray(reviewed) || reviewed.length > findings.length) throw new Error('Invalid Copilot scan review.');
+            const indexes = new Set();
+            const issues = reviewed.map(item => {
+              if (!item || !Number.isInteger(item.index) || item.index < 0 || item.index >= findings.length || indexes.has(item.index)) throw new Error('Invalid Copilot scan finding index.');
+              indexes.add(item.index);
+              return validateIssue({
+                ...findings[item.index], context, evidence: item.evidence, next: item.next, docs: [],
+                diagnosis: item.diagnosis || '', suggestions: Array.isArray(item.suggestions) ? item.suggestions : []
+              });
+            });
+            for (const issue of issues) saveIssue(issue);
+          }
           result = { sent: true };
           break;
         case '/api/ask-manual-copilot': {
@@ -401,24 +615,33 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
           const hasTarget = body.kind !== undefined || body.name !== undefined || body.namespace !== undefined;
           const resourceTarget = hasTarget ? target() : null;
           if (!askManualCopilot) throw new Error('Copilot investigation is unavailable in this session.');
-          if (!resourceTarget) {
-            await askManualCopilot(state.context, null, body.question.trim());
-            result = { sent: true };
-            break;
-          }
           const context = state.context;
           const generation = targetGeneration;
-          const key = evidenceKey(context, resourceTarget);
+          const key = resourceTarget ? evidenceKey(context, resourceTarget) : JSON.stringify([context, '', '', '']);
           const requestId = (summaryRequests.get(key) || 0) + 1;
           summaryRequests.set(key, requestId);
-          const signals = await collectResourceSignals(context, resourceTarget, resourceEvidence.get(key));
+          const signals = resourceTarget
+            ? await collectResourceSignals(context, resourceTarget, resourceEvidence.get(key))
+            : [
+              ...scanSnapshot.issues.slice(0, 100).map(issue => `${issue.title}: ${issue.evidence}`),
+              ...scanSnapshot.errors.map(() => 'A cluster check was incomplete.'),
+              ...(scanSnapshot.issues.length > 100 ? ['Only the first 100 cluster findings were included.'] : []),
+              ...(!scanSnapshot.issues.length ? ['No scan findings are available; this does not establish cluster health.'] : [])
+            ];
           if (generation !== targetGeneration) throw new Error('The selected context or namespace changed during evidence collection.');
-          const summary = await askManualCopilot(context, resourceTarget, body.question.trim(), signals);
+          const initial = resourceTarget && state.resourceSummaries.find(item => evidenceKey(context, item) === key);
+          const history = [
+            ...(initial ? [{ role: 'assistant', content: initial.summary }] : []),
+            ...(conversationFor(resourceTarget)?.messages || [])
+          ].map(message => message.role === 'assistant'
+            ? { ...message, content: message.content.replace(/^Cluster: [^\n]+\n\n/, '') }
+            : message);
+          const summary = await askManualCopilot(context, resourceTarget, body.question.trim(), signals, history);
           if (generation !== targetGeneration) throw new Error('The selected context or namespace changed during the investigation.');
           if (summaryRequests.get(key) !== requestId) throw new Error('A newer investigation replaced this request.');
-          if (typeof summary !== 'string' || !summary.trim()) throw new Error('Copilot did not return a summary. Check the chat for the investigation outcome.');
-          state.resourceSummaries = state.resourceSummaries.filter(item => evidenceKey(context, item) !== key);
-          state.resourceSummaries.push({ ...resourceTarget, summary });
+          if (typeof summary !== 'string' || !summary.trim()) throw new Error('Copilot did not return an answer.');
+          const diagnostic = resourceTarget ? decorateDiagnostic(context, summary, signals) : summary;
+          appendConversation(resourceTarget, body.question.trim(), diagnostic);
           result = { sent: true, summary };
           break;
         }
@@ -448,10 +671,14 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
           const context = state.context;
           const key = evidenceKey(context, resourceTarget);
           resourceEvidence.delete(key);
-          const details = await kubernetes.resource(context, resourceTarget);
+          const type = discoveredTypes.get(resourceTarget.kind);
+          const generic = type && !/^[A-Z]/.test(resourceTarget.kind);
+          const details = generic ? await kubernetes.resourceMetadata(context, type, resourceTarget) : await kubernetes.resource(context, resourceTarget);
           let events;
           let eventError;
-          try {
+          if (generic) {
+            eventError = 'Events are not collected for metadata-only resources.';
+          } else try {
             events = await kubernetes.resourceEvents(context, resourceTarget, details.uid);
           } catch (error) {
             eventError = error.message;
@@ -463,6 +690,7 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
         }
         case '/api/describe': {
           const resourceTarget = target();
+          if (discoveredTypes.has(resourceTarget.kind) && !/^[A-Z]/.test(resourceTarget.kind)) throw new Error('Describe is unavailable for metadata-only resources.');
           result = await kubernetes.describe(state.context, resourceTarget);
           target();
           break;
@@ -480,9 +708,14 @@ export async function createInstance({ kubernetes = createKubernetes(), askCopil
           const summary = await askResourceCopilot(context, resourceTarget, signals);
           if (generation !== targetGeneration) throw new Error('The selected context or namespace changed during the investigation.');
           if (summaryRequests.get(key) !== requestId) throw new Error('A newer investigation replaced this request.');
-          if (typeof summary !== 'string' || !summary.trim()) throw new Error('Copilot did not return a summary. Check the chat for the investigation outcome.');
+          if (typeof summary !== 'string' || !summary.trim()) throw new Error('Copilot did not return a diagnostic summary.');
           state.resourceSummaries = state.resourceSummaries.filter(item => evidenceKey(context, item) !== key);
-          state.resourceSummaries.push({ ...resourceTarget, summary });
+          const diagnostic = decorateDiagnostic(context, summary, signals);
+          state.resourceSummaries.push({
+            ...resourceTarget,
+            summary: diagnostic,
+            activity: investigationActivity(signals)
+          });
           result = { sent: true, summary };
           break;
         }

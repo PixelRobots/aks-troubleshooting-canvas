@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
 import { createKubernetes } from '../extensions/aks-canvas/kubernetes.mjs';
 import { createInstance } from '../extensions/aks-canvas/server.mjs';
@@ -14,6 +15,49 @@ test('canvas manifest exposes single and batch issue publishing', async () => {
   assert.ok(action.inputSchema.required.includes('evidence'));
   const batch = manifest.canvases[0].actions.find(item => item.name === 'publish_issues');
   assert.ok(batch.inputSchema.properties.issues.items.required.includes('evidence'));
+});
+
+test('canvas investigations use a tool-free workflow and surface workflow failures', async () => {
+  const source = (await readFile(new URL('../extensions/aks-canvas/extension.mjs', import.meta.url), 'utf8'))
+    .replace(/^import .+;\r?\n/gm, '');
+  let canvas;
+  let instanceOptions;
+  const requests = [];
+  let outcome = 'completed';
+  const completeSummary = '## Observations\nThe pod is Pending.\n\n## Next steps\nCheck scheduling.';
+  await runInNewContext(`(async () => {\n${source}\n})()`, {
+    declaration: { canvases: [{ actions: [] }] },
+    createCanvas: value => value,
+    defineWorkflow: value => value,
+    joinSession: async options => {
+      [canvas] = options.canvases;
+      return { workflow: { run: async (workflow, request) => {
+        requests.push(request);
+        if (outcome !== 'completed') return { status: outcome };
+        const result = await workflow.run({
+          args: request.args, agents: { investigator: 'investigator', diagnostician: 'diagnostician', verifier: 'verifier' },
+          agent: async (_prompt, options) => {
+            assert.ok(['investigator', 'diagnostician', 'verifier'].includes(options.agent));
+            if (options.agent === 'investigator') return 'Evidence: pod Pending.';
+            return options.schema
+              ? { findings: [{ index: 0, evidence: 'Pending', next: 'Check scheduling.', diagnosis: completeSummary, suggestions: ['Review pod'] }] }
+              : completeSummary;
+          }
+        });
+        return { status: 'completed', result };
+      } } };
+    },
+    createInstance: async options => { instanceOptions = options; return { url: 'http://127.0.0.1/' }; }
+  });
+  await canvas.open({ instanceId: 'test-instance' });
+  const summary = await instanceOptions.askResourceCopilot('ctx', { kind: 'Pod', name: 'web', namespace: 'shop' }, ['Pending']);
+  assert.equal(summary, completeSummary);
+  assert.equal(requests[0].notifyOnComplete, false);
+  assert.match(requests[0].args.prompt, /Pending/);
+  const review = await instanceOptions.askCopilot('ctx', [{ title: 'Pending' }], []);
+  assert.equal(review[0].index, 0);
+  outcome = 'error';
+  await assert.rejects(instanceOptions.askResourceCopilot('ctx', { kind: 'Pod', name: 'web', namespace: 'shop' }, []), /workflow did not complete/);
 });
 
 test('issue checks report current signals with evidence without treating normal workloads as problems', () => {
@@ -127,7 +171,7 @@ test('cluster and Copilot findings merge under Deployment and CronJob owners', (
     { kind: 'Pod', name: 'backup-123', namespace: 'shop', title: 'Pod backup-123: Pending', evidence: 'Pod is pending', next: 'Review scheduling', docs: [] }
   ];
   const copilot = [
-    { kind: 'Pod', name: 'web-abc', namespace: 'shop', title: 'Pod web-abc: Pending', evidence: 'No assigned node is reported', next: 'Check the owner workload', docs: [] },
+    { kind: 'Pod', name: 'web-abc', namespace: 'shop', title: 'Pod web-abc: Pending', evidence: 'No assigned node is reported', next: 'Check the owner workload', docs: [], diagnosis: '## Summary\nScheduling is unconfirmed.', suggestions: ['Show pod events'] },
     { kind: 'PersistentVolumeClaim', name: 'backup-data', namespace: 'shop', title: 'PVC backup-data: unavailable', evidence: 'Copilot observed a related claim signal', next: 'Inspect the claim state', docs: [] }
   ];
   const groups = groupFindings(cluster, copilot, resources);
@@ -137,6 +181,8 @@ test('cluster and Copilot findings merge under Deployment and CronJob owners', (
   const deployment = groups.find(group => group.target.kind === 'Deployment');
   assert.equal(deployment.signals.length, 1);
   assert.deepEqual(deployment.signals[0].sources, ['Cluster check', 'Copilot']);
+  assert.equal(deployment.signals[0].diagnoses[0], '## Summary\nScheduling is unconfirmed.');
+  assert.deepEqual(deployment.signals[0].suggestions, ['Show pod events']);
   const cronjob = groups.find(group => group.target.kind === 'CronJob');
   assert.equal(cronjob.resources.size, 2);
   assert.equal(cronjob.signals.length, 2);
@@ -350,6 +396,30 @@ test('CronJob investigation projects only reported scheduling status', async () 
   assert.equal(missing.activeJobs, undefined);
   assert.equal(missing.suspended, undefined);
   assert.equal(missing.lastSuccessfulTime, undefined);
+});
+
+test('SecretProviderClass projection includes names but no object values or identity secrets', async () => {
+  const kube = createKubernetes(async args => {
+    assert.deepEqual(args.slice(0, 3), ['--context', 'ctx', '-n']);
+    return JSON.stringify({
+      apiVersion: 'secrets-store.csi.x-k8s.io/v1', kind: 'SecretProviderClass',
+      metadata: { name: 'backup-spc', uid: '12345678-1234-1234-1234-123456789012' },
+      spec: {
+        provider: 'azure',
+        parameters: {
+          keyvaultName: 'backup-vault',
+          clientID: 'private-identity-value',
+          tenantId: 'private-tenant-value',
+          objects: 'array:\\n  - |\\n    objectName: storage-account-name\\n    objectType: secret\\n    objectVersion: \"\"'
+        }
+      }
+    });
+  });
+  const result = await kube.resource('ctx', { kind: 'SecretProviderClass', name: 'backup-spc', namespace: 'backup' });
+  assert.equal(result.provider, 'azure');
+  assert.equal(result.keyVaultName, 'backup-vault');
+  assert.deepEqual(result.secretProviderObjects, ['storage-account-name']);
+  assert.doesNotMatch(JSON.stringify(result), /private-identity-value|private-tenant-value/);
 });
 
 test('cluster pod scanning follows encoded continuation tokens without buffering the entire list', async () => {
@@ -596,6 +666,55 @@ test('cluster-scoped nodes can be inspected without selecting a namespace', asyn
   assert.equal((await request('resource', { ...node, kind: 'Pod' })).status, 400);
 });
 
+test('resource explorer discovers custom types and investigates only projected metadata', async t => {
+  const calls = [];
+  const sent = [];
+  const kubernetes = createKubernetes(async args => {
+    calls.push(args);
+    if (args[0] === 'config') return 'ctx\nother\n';
+    if (args.includes('api-resources')) return args.includes('--namespaced=true')
+      ? 'pods\nsecrets\nwidgets.example.io\n' : 'nodes\nclusterwidgets.example.io\n';
+    if (args.includes('namespaces')) return JSON.stringify({ items: [{ metadata: { name: 'shop' } }] });
+    if (args.includes('get') && args.some(arg => arg.includes('range .items'))) return 'first\nsecond\n';
+    if (args.includes('widgets.example.io') || args.includes('clusterwidgets.example.io') || args.includes('secrets')) return 'uid-123\t2026-01-01T00:00:00Z';
+    throw new Error('Unexpected request');
+  });
+  const instance = await createInstance({
+    kubernetes,
+    askResourceCopilot: async (_context, target, signals) => { sent.push({ target, signals }); return 'Published'; }
+  });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = (path, data = {}) => fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  });
+  await request('select-context', { context: 'ctx' });
+  const types = await (await request('resource-types')).json();
+  assert.ok(types.some(type => type.kind === 'widgets.example.io' && type.namespaced));
+  assert.ok(types.some(type => type.kind === 'clusterwidgets.example.io' && !type.namespaced));
+  assert.ok(types.some(type => type.kind === 'Pod'));
+  const cluster = { context: 'ctx', kind: 'clusterwidgets.example.io', namespace: '', name: 'first' };
+  assert.deepEqual(await (await request('resource-names', cluster)).json(), ['first', 'second']);
+  const clusterDetail = await (await request('resource', cluster)).json();
+  assert.equal(clusterDetail.details.metadataOnly, true);
+  assert.match(clusterDetail.eventError, /not collected/);
+  assert.equal((await request('describe', cluster)).status, 400);
+  assert.equal((await request('ask-resource-copilot', cluster)).status, 200);
+  assert.match(sent[0].signals.join(' '), /Only resource metadata was collected/);
+  assert.equal(instance.publishIssue({ ...cluster, title: 'Review resource', evidence: 'Only metadata was available.', next: 'Review authorized status.', docs: [] }).aiIssues[0].kind, cluster.kind);
+  assert.equal((await request('resource', { ...cluster, kind: 'unknown.example.io' })).status, 400);
+  await request('select-namespace', { namespace: 'shop' });
+  const secret = { context: 'ctx', kind: 'secrets', namespace: 'shop', name: 'first' };
+  assert.deepEqual(await (await request('resource-names', secret)).json(), ['first', 'second']);
+  assert.equal((await request('resource', secret)).status, 200);
+  assert.equal((await request('describe', secret)).status, 400);
+  assert.ok(calls.filter(args => args.includes('secrets')).every(args => args.some(arg => arg.includes('.metadata.'))));
+  assert.ok(calls.filter(args => args.includes('clusterwidgets.example.io')).every(args => !args.includes('-n')));
+  await request('select-context', { context: 'other' });
+  assert.equal((await request('resource', { ...cluster, context: 'other' })).status, 400);
+});
+
 test('scan retains unknown nodes and reports Azure verification failures', async t => {
   const node = { name: 'node-a', ready: 'Unknown', pool: 'pool1' };
   const kubernetes = {
@@ -625,7 +744,10 @@ test('Copilot requests are context-bound and include verified scan inputs', asyn
   const sent = [];
   const instance = await createInstance({
     kubernetes: { contexts: async () => ['ctx-a', 'ctx-b'] },
-    askCopilot: async (...args) => { sent.push(args); }
+    askCopilot: async (...args) => {
+      sent.push(args);
+      return [{ index: 0, evidence: 'A current Pending pod was reported.', next: 'Inspect current events.', diagnosis: '## Summary\nPending requires investigation.', suggestions: ['Show recent events'] }];
+    }
   });
   t.after(() => instance.close());
   const page = await (await fetch(instance.url)).text();
@@ -637,7 +759,13 @@ test('Copilot requests are context-bound and include verified scan inputs', asyn
   assert.equal((await request('ask-copilot', { context: 'ctx-b' })).status, 400);
   const finding = { title: 'Pod checkout: Pending', evidence: 'Current pod state: Pending.', next: 'Review events.', kind: 'Pod', name: 'checkout', namespace: 'shop' };
   assert.equal((await request('ask-copilot', { context: 'ctx-a', findings: [finding], scanErrors: ['Nodes: Forbidden'] })).status, 200);
-  assert.deepEqual(sent, [['ctx-a', [finding], ['Nodes: Forbidden']]]);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].slice(0, 3), ['ctx-a', [finding], ['Nodes: Forbidden']]);
+  assert.equal(sent[0][3][0].index, 0);
+  assert.match(sent[0][3][0].signals.join(' '), /resource evidence could not be read/);
+  const state = await (await request('state')).json();
+  assert.match(state.aiIssues[0].diagnosis, /Summary/);
+  assert.deepEqual(state.aiIssues[0].suggestions, ['Show recent events']);
   assert.equal((await request('ask-copilot', { context: 'ctx-a', findings: [{ ...finding, kind: 'Secret' }] })).status, 400);
 });
 
@@ -664,12 +792,18 @@ test('manual Copilot questions require the selected context and resource target'
   assert.equal((await request('ask-manual-copilot', { context: 'ctx-a', question: 'Check cluster' })).status, 200);
   assert.equal((await request('ask-manual-copilot', resource)).status, 200);
   assert.deepEqual(sent, [
-    ['ctx-a', null, 'Check cluster'],
+    ['ctx-a', null, 'Check cluster', ['No scan findings are available; this does not establish cluster health.'], []],
     ['ctx-a', { kind: 'Pod', name: 'pod-a', namespace: 'shop' }, 'Why pending?', [
-      'Resource evidence was not available; do not assume the resource is healthy.',
+      'Current resource evidence could not be read; do not assume the resource is healthy.',
       'Related pod 1 status or events could not be read; evidence is incomplete.'
-    ]]
+    ], []]
   ]);
+  const state = await (await request('state', {})).json();
+  assert.equal(state.conversations.length, 2);
+  assert.equal(state.conversations[1].messages[0].content, 'Why pending?');
+  await request('ask-manual-copilot', { ...resource, question: 'What next?' });
+  assert.equal(sent[2][4][0].content, 'Why pending?');
+  assert.equal(sent[2][4][1].content, 'Answer to the resource question');
 });
 
 test('focused investigations sample related pods locally and retain the complete response', async t => {
@@ -720,7 +854,110 @@ test('focused investigations sample related pods locally and retain the complete
   assert.match(prompts[0].join(' '), /FailedScheduling.*connection refused.*previous logs could not be read/);
   assert.doesNotMatch(JSON.stringify(prompts), /private/);
   const state = await (await request('state')).json();
-  assert.equal(state.resourceSummaries[0].summary, 'Complete answer\nwith the actual checks.');
+  assert.match(state.resourceSummaries[0].summary, /Cluster: ctx/);
+  assert.match(state.resourceSummaries[0].summary, /Complete answer\nwith the actual checks\.$/);
+  assert.match(state.resourceSummaries[0].activity.join(' '), /selected resource.*pod 1.*log indicators/i);
+});
+
+test('focused investigations check bounded related jobs and storage without forwarding configuration', async t => {
+  const reads = [];
+  let observed;
+  const jobs = Array.from({ length: 4 }, (_, i) => ({
+    kind: 'Job', name: `job-${i}`, namespace: 'shop', owners: [{ kind: 'CronJob', name: 'backup' }]
+  }));
+  const pod = { kind: 'Pod', name: 'pod-a', namespace: 'shop', owners: [{ kind: 'Job', name: 'job-0' }] };
+  const kubernetes = {
+    contexts: async () => ['ctx'], namespaces: async () => ['shop'],
+    clusterPods: async () => [pod], clusterDeployments: async () => [], clusterReplicaSets: async () => [],
+    clusterJobs: async () => jobs, nodes: async () => [],
+    clusterWarningEvents: async () => ({ events: [], truncated: false }),
+    resource: async (context, target) => {
+      reads.push([context, target.kind, target.name]);
+      if (target.kind === 'SecretProviderClass') return { ...target, provider: 'azure', private: 'private-object' };
+      if (target.kind === 'PersistentVolumeClaim') return { ...target, phase: 'Bound' };
+      if (target.kind === 'Job') return { ...target, jobActive: 1, jobFailed: 2, conditions: [], containers: [] };
+      return {
+        ...target, uid: 'uid-123', phase: 'Pending', conditions: [], containers: [],
+        related: target.kind === 'Pod' ? [{ kind: 'PersistentVolumeClaim', name: 'claim' }, { kind: 'SecretProviderClass', name: 'class' }] : []
+      };
+    },
+    resourceEvents: async () => [],
+    logs: async () => ''
+  };
+  const instance = await createInstance({
+    kubernetes, checkNodes: async nodes => ({ nodes, errors: [] }),
+    askResourceCopilot: async (_context, _target, signals) => { observed = signals; return 'Summary'; }
+  });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = (path, data = {}) => fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  });
+  await request('select-context', { context: 'ctx' });
+  await request('scan');
+  await request('select-namespace', { namespace: 'shop' });
+  const target = { context: 'ctx', namespace: 'shop', kind: 'CronJob', name: 'backup' };
+  await request('resource', target);
+  assert.equal((await request('ask-resource-copilot', target)).status, 200);
+  assert.ok(reads.every(([context]) => context === 'ctx'));
+  assert.equal(reads.filter(([, kind]) => kind === 'Job').length, 3);
+  assert.match(observed.join(' '), /PersistentVolumeClaim.*Bound/);
+  assert.match(observed.join(' '), /SecretProviderClass.*Azure provider/);
+  assert.match(observed.join(' '), /Only 3 of 4 related Jobs/);
+  assert.match(observed.join(' '), /Job reports 2 failed pods/);
+  assert.doesNotMatch(JSON.stringify(observed), /private-object|claim|class/);
+});
+
+test('scan review rejects invalid indices instead of publishing to another target', async t => {
+  const instance = await createInstance({
+    kubernetes: { contexts: async () => ['ctx'] },
+    askCopilot: async () => [{ index: 1, evidence: 'Wrong target', next: 'Inspect' }]
+  });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = (path, data = {}) => fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  });
+  await request('select-context', { context: 'ctx' });
+  const finding = { title: 'Pending', evidence: 'Pending', next: 'Inspect', kind: 'Pod', name: 'pod-a', namespace: 'shop' };
+  assert.equal((await request('ask-copilot', { context: 'ctx', findings: [finding] })).status, 400);
+  assert.deepEqual((await (await request('state')).json()).aiIssues, []);
+});
+
+test('evidence collection stops before further reads when the namespace changes', async t => {
+  let release;
+  let started;
+  const waiting = new Promise(resolve => { release = resolve; });
+  const began = new Promise(resolve => { started = resolve; });
+  let eventReads = 0;
+  const instance = await createInstance({
+    kubernetes: {
+      contexts: async () => ['ctx'], namespaces: async () => ['shop', 'other'],
+      resource: async (_context, target) => {
+        started();
+        await waiting;
+        return { ...target, uid: 'uid-123', conditions: [], containers: [], related: [] };
+      },
+      resourceEvents: async () => { eventReads++; return []; }
+    },
+    askResourceCopilot: async () => 'Should not be requested'
+  });
+  t.after(() => instance.close());
+  const page = await (await fetch(instance.url)).text();
+  const token = page.match(/name="canvas-token" content="([^"]+)"/)[1];
+  const request = (path, data = {}) => fetch(new URL(`api/${path}`, instance.url), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Canvas-Token': token }, body: JSON.stringify(data)
+  });
+  await request('select-context', { context: 'ctx' });
+  await request('select-namespace', { namespace: 'shop' });
+  const pending = request('ask-resource-copilot', { context: 'ctx', namespace: 'shop', kind: 'Pod', name: 'pod-a' });
+  await began;
+  await request('select-namespace', { namespace: 'other' });
+  release();
+  assert.equal((await pending).status, 400);
+  assert.equal(eventReads, 0);
 });
 
 test('focused investigation does not save a response after the selected namespace changes', async t => {
@@ -769,7 +1006,7 @@ test('focused investigation reports a missing Copilot response', async t => {
   await request('select-namespace', { namespace: 'shop' });
   const response = await request('ask-resource-copilot', { context: 'ctx', namespace: 'shop', kind: 'Deployment', name: 'web' });
   assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /did not return a summary/);
+  assert.match((await response.json()).error, /did not return a (?:diagnostic )?summary/);
   assert.deepEqual((await (await request('state')).json()).resourceSummaries, []);
 });
 
@@ -846,7 +1083,7 @@ test('resource investigation shares only allowlisted indicators and clears them 
   await request('select-namespace', { namespace: 'other' });
   await request('select-namespace', { namespace: 'shop' });
   await request('ask-resource-copilot', target);
-  assert.match(requested[1][0], /not available/);
+  assert.match(requested[1][0], /Pod phase is Pending/);
   const deployment = { ...target, kind: 'Deployment', name: 'checkout' };
   await request('resource', deployment);
   await request('ask-resource-copilot', deployment);
@@ -907,6 +1144,7 @@ test('focused evidence extracts fixed diagnostic indicators without forwarding e
   assert.match(signals, /current logs.*no such host.*certificate signed by unknown authority/);
   assert.match(signals, /previous logs.*authentication failed/);
   assert.doesNotMatch(signals, /HTTP status 403|access-denied indication|private-/);
+  assert.match(signals, /event references Key Vault "private-vault" and object|event includes HTTP 404/i, 'Key Vault names are safe only when part of an allowlisted event URL');
 
   const fragments = ['Insufficient cpu', 'Insufficient memory', 'Insufficient ephemeral-storage', 'untolerated taint'];
   kubernetes.resourceEvents = async () => Array.from({ length: 11 }, (_, index) => ({

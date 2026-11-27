@@ -7,6 +7,12 @@ let logsLoaded = false;
 let workloadsCache = [];
 let workloadsState = 'idle';
 let workloadsVersion = 0;
+let explorerTypes = [];
+let explorerNames = [];
+let explorerVersion = 0;
+let explorerDiscoveryVersion = 0;
+let explorerStatus = 'Select a resource type.';
+let explorerProblemsOnly = false;
 let scanCache = [];
 let scanErrors = [];
 let scanResources = [];
@@ -28,6 +34,8 @@ let resourceRequestVersion = 0;
 let summarySequence = 0;
 const summaryStates = new Map();
 const tabs = ['overview', 'workloads'];
+const inspectorTabs = ['overview', 'events', 'related', 'describe', 'logs'];
+const commonExplorerKinds = ['Pod', 'Deployment', 'StatefulSet', 'DaemonSet', 'Job', 'CronJob', 'PersistentVolumeClaim', 'Node'];
 const investigableKinds = new Set([
   'Pod', 'Deployment', 'ReplicaSet', 'Job', 'CronJob', 'StatefulSet', 'DaemonSet',
   'ReplicationController', 'PersistentVolumeClaim', 'SecretProviderClass', 'Node'
@@ -51,6 +59,30 @@ function showTab(name, focus = false) {
     if (active && focus) button.focus();
   }
 }
+function showInspectorTab(name) {
+  if (name === 'events' && document.querySelector('[data-inspector-tab="events"]').hidden) name = 'describe';
+  for (const tab of inspectorTabs) {
+    const button = document.querySelector(`[data-inspector-tab="${tab}"]`);
+    const active = tab === name;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+    document.querySelector(`[data-inspector-panel="${tab}"]`).hidden = !active;
+  }
+}
+function relativeAge(value) {
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return 'Not reported';
+  const minutes = Math.max(0, Math.round((Date.now() - time) / 60000));
+  if (minutes < 1) return 'Just created';
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+for (const tab of inspectorTabs) {
+  document.querySelector(`[data-inspector-tab="${tab}"]`).addEventListener('click', () => showInspectorTab(tab));
+}
+showInspectorTab('overview');
 
 for (const [index, tab] of tabs.entries()) {
   const button = $(`tab-${tab}`);
@@ -90,7 +122,8 @@ function setOptions(select, items, selected, placeholder) {
 function renderState(next) {
   const findingsChanged = state.context !== next.context || state.namespace !== next.namespace ||
     JSON.stringify(state.aiIssues || []) !== JSON.stringify(next.aiIssues || []) ||
-    JSON.stringify(state.resourceSummaries || []) !== JSON.stringify(next.resourceSummaries || []);
+    JSON.stringify(state.resourceSummaries || []) !== JSON.stringify(next.resourceSummaries || []) ||
+    JSON.stringify(state.conversations || []) !== JSON.stringify(next.conversations || []);
   state = next;
   renderOverviewCopilotStatus();
   $('cluster-title').textContent = state.context || 'Selected cluster';
@@ -104,6 +137,7 @@ function renderState(next) {
     renderNamespaceIssues();
     renderResourceIssues();
     renderResourceRelated();
+    renderConversation('cluster-conversation', null);
   }
   if (selectedResource) $('resource-scale').hidden = !(selectedResource.kind === 'Deployment' && state.editing);
 }
@@ -152,7 +186,10 @@ function setSummaryState(target, phase, id) {
   if (id !== undefined && summaryStates.get(key)?.id !== id) return null;
   const nextId = id ?? ++summarySequence;
   summaryStates.set(key, { phase, id: nextId });
-  if (selectedResource && summaryKey(selectedResource) === key) renderSummaryAge();
+  if (selectedResource && summaryKey(selectedResource) === key) {
+    $('resource-scan-details').open = phase !== 'complete';
+    renderSummaryAge();
+  }
   return nextId;
 }
 function renderSummaryAge() {
@@ -197,7 +234,7 @@ function appendSummaryInline(container, value) {
   }
   if (start < value.length) text(value.slice(start));
 }
-function renderSummary(container, value) {
+function renderSummary(container, value, target = selectedResource) {
   container.replaceChildren();
   const lines = value.replace(/\r\n?/g, '\n').split('\n');
   let list;
@@ -220,6 +257,28 @@ function renderSummary(container, value) {
     code = null;
   };
   for (const line of lines) {
+    const suggestionText = line.match(/^\s*SUGGESTIONS:\s*(.+?)\s*$/i);
+    if (suggestionText) {
+      flushParagraph();
+      list = null;
+      const suggestions = suggestionText[1].split('|').map(item => item.trim()).filter(Boolean).slice(0, 3);
+      if (suggestions.length) {
+        const group = document.createElement('div');
+        group.className = 'suggestions';
+        const label = document.createElement('strong');
+        label.textContent = 'Suggested follow-ups';
+        group.append(label);
+        for (const suggestion of suggestions) {
+          const button = document.createElement('button');
+          button.className = 'secondary';
+          button.textContent = suggestion;
+          button.addEventListener('click', () => askSuggestion(suggestion, target));
+          group.append(button);
+        }
+        container.append(group);
+      }
+      continue;
+    }
     if (/^\s*```/.test(line)) {
       flushParagraph();
       list = null;
@@ -256,6 +315,15 @@ function renderSummary(container, value) {
   }
   if (code) flushCode();
   flushParagraph();
+}
+async function askSuggestion(suggestion, target = selectedResource) {
+  if (target && (!selectedResource || !sameTarget(selectedResource, target))) {
+    await openResource(target, { manual: true, investigate: false });
+  }
+  const resource = Boolean(target && selectedResource);
+  const prefix = resource ? 'resource' : 'cluster';
+  $(`${prefix}-question`).value = suggestion;
+  await askManualQuestion(resource);
 }
 function ownedBy(target, owner, resources) {
   const visited = new Set();
@@ -298,6 +366,33 @@ function findingGroupCard(group, inspect = true) {
   const overview = document.createElement('p');
   overview.textContent = `Signals: ${distinctTitles.slice(0, 3).join('; ')}${distinctTitles.length > 3 ? `; and ${distinctTitles.length - 3} more` : ''}`;
   card.append(overview);
+  const diagnosis = group.signals.find(signal => signal.diagnoses?.length);
+  if (diagnosis) {
+    const details = document.createElement('details');
+    details.className = 'diagnosis-preview';
+    const label = document.createElement('summary');
+    label.textContent = 'AI diagnosis';
+    const content = document.createElement('div');
+    content.className = 'resource-summary';
+    renderSummary(content, diagnosis.diagnoses[0], group.target);
+    if (diagnosis.suggestions?.length) {
+      const suggestions = document.createElement('div');
+      suggestions.className = 'suggestions';
+      const heading = document.createElement('strong');
+      heading.textContent = 'Suggested follow-ups';
+      suggestions.append(heading);
+      for (const text of diagnosis.suggestions.slice(0, 3)) {
+        const button = document.createElement('button');
+        button.className = 'secondary';
+        button.textContent = text;
+        button.addEventListener('click', () => askSuggestion(text, group.target));
+        suggestions.append(button);
+      }
+      content.append(suggestions);
+    }
+    details.append(label, content);
+    card.append(details);
+  }
 
   const actions = document.createElement('div');
   actions.className = 'actions';
@@ -339,12 +434,13 @@ async function scanIssues() {
   const context = state.context;
   if (!context) return;
   const version = ++scanVersion;
+  $('scan-progress').hidden = false;
   $('scan-spinner').hidden = false;
   $('scan-result-icon').hidden = true;
   $('scan').hidden = true;
   $('scan').disabled = true;
   $('overview-title').textContent = 'Checking cluster…';
-  $('scan-status').textContent = 'Scanning workloads, ownership and nodes…';
+  $('scan-status').textContent = 'Scanning workloads, ownership, nodes and warning events…';
   $('issues').replaceChildren();
   $('cluster-findings').hidden = true;
   $('show-more-issues').hidden = true;
@@ -414,13 +510,16 @@ function renderOverviewCopilotStatus() {
   if (clusterCopilotStatus !== 'complete') return;
   if (copilotReviewCount > 100) {
     $('ai-progress').hidden = false;
-    $('ai-status').textContent = `Only the first 100 of ${copilotReviewCount} grouped findings were sent to Copilot. Check chat for the review outcome.`;
+    $('ai-status').textContent = `Only the first 100 of ${copilotReviewCount} grouped findings were reviewed by Copilot.`;
   } else if ((state.aiIssues || []).some(issue => issue.kind && issue.name)) {
-    $('ai-progress').hidden = true;
-    $('ai-status').textContent = '';
+    const detailed = (state.aiIssues || []).filter(issue => issue.diagnosis?.trim()).length;
+    $('ai-progress').hidden = false;
+    $('ai-status').textContent = detailed
+      ? `${detailed} detailed AI ${detailed === 1 ? 'diagnosis is' : 'diagnoses are'} ready. Other findings retain summary-only evidence.`
+      : 'AI summary review complete. Open a finding for a deeper diagnosis.';
   } else {
     $('ai-progress').hidden = false;
-    $('ai-status').textContent = 'No resource-targeted Copilot findings are available. Check chat for the review outcome.';
+    $('ai-status').textContent = 'No resource-targeted Copilot findings are available.';
   }
 }
 function groupClusterSignals(signals) {
@@ -441,8 +540,18 @@ function renderResourceIssues() {
   scanContainer.replaceChildren();
   $('resource-summary').replaceChildren();
   if (!selectedResource) return;
+  renderConversation('resource-conversation', selectedResource);
   const summary = (state.resourceSummaries || []).find(item => sameTarget(item, selectedResource));
   if (summary) renderSummary($('resource-summary'), summary.summary);
+  const activity = summary?.activity || [];
+  $('resource-activity').hidden = !activity.length;
+  $('resource-activity-summary').textContent = `Investigation activity · ${activity.length} ${activity.length === 1 ? 'step' : 'steps'}`;
+  $('resource-activity-list').replaceChildren();
+  for (const step of activity) {
+    const item = document.createElement('li');
+    item.textContent = step;
+    $('resource-activity-list').append(item);
+  }
   renderSummaryAge();
   $('resource-scan-status').textContent = scanErrors.length
     ? `Some cluster checks failed; scan findings are incomplete: ${scanErrors.join(' | ')}`
@@ -621,7 +730,12 @@ function renderResourceRelated() {
     }
   }
   const unique = related.filter((item, index) => !related.slice(0, index).some(other => sameTarget(item, other)));
-  if (!unique.length) container.textContent = 'No supported related resources found.';
+  if (!unique.length) {
+    container.textContent = 'No related resources needed investigation.';
+    document.querySelector('[data-inspector-tab="related"]').hidden = true;
+  } else {
+    document.querySelector('[data-inspector-tab="related"]').hidden = false;
+  }
   for (const item of unique) {
     const button = document.createElement('button');
     button.className = 'secondary';
@@ -647,7 +761,9 @@ async function loadResource(target, version) {
     $('resource-phase').textContent = result.details.phase ||
       (result.details.kind === 'CronJob' && typeof result.details.suspended === 'boolean'
         ? (result.details.suspended ? 'Suspended' : 'Not suspended') : 'Not reported');
-    $('resource-created').textContent = result.details.created || 'Not reported';
+    $('resource-created').textContent = result.details.created
+      ? relativeAge(result.details.created)
+      : 'Not reported';
     $('resource-status').textContent = '';
     const evidence = $('resource-evidence');
     evidence.replaceChildren();
@@ -658,6 +774,10 @@ async function loadResource(target, version) {
       evidence.append(row(`Container ${container.name || 'unknown'} · ${container.waitingReason || (container.ready ? 'Ready' : 'Not ready')}`, `${container.restarts ?? 0} restarts${container.waitingMessage ? ` · ${container.waitingMessage}` : ''}`));
     }
     if (result.details.provider) evidence.append(row('CSI provider', result.details.provider));
+    if (result.details.keyVaultName) evidence.append(row('Key Vault reference', result.details.keyVaultName));
+    if (result.details.secretProviderObjects?.length) {
+      evidence.append(row('Referenced Key Vault objects', result.details.secretProviderObjects.join(', ')));
+    }
     if (result.details.kind === 'Deployment') evidence.append(row('Available replicas', `${result.details.available} of ${result.details.desired}`));
     if (result.details.kind === 'CronJob') {
       if (result.details.schedule) evidence.append(row('Schedule', result.details.schedule));
@@ -666,9 +786,14 @@ async function loadResource(target, version) {
       if (result.details.lastScheduleTime) evidence.append(row('Last scheduled', result.details.lastScheduleTime));
       if (result.details.lastSuccessfulTime) evidence.append(row('Last successful job', result.details.lastSuccessfulTime));
     }
-    if (!evidence.children.length) evidence.textContent = 'No conditions or container status reported.';
+    document.querySelector('[data-inspector-tab="overview"]').hidden = !evidence.children.length;
+    if (!evidence.children.length) {
+      evidence.textContent = 'No additional status beyond the summary was reported.';
+      showInspectorTab('events');
+    }
     const events = $('resource-events');
     events.replaceChildren();
+    document.querySelector('[data-inspector-tab="events"]').hidden = !result.eventError && !result.events.length;
     if (result.eventError) events.textContent = `Events could not be loaded: ${result.eventError}`;
     else if (!result.events.length) events.textContent = 'No recent events found. Events are short-lived.';
     else for (const event of result.events) events.append(row(`${event.type || 'Event'} · ${event.reason || 'Unknown'}`, `${event.time || 'Unknown time'} · ${event.message || 'No message'}${event.count ? ` · ${event.count} occurrences` : ''}`));
@@ -727,6 +852,7 @@ async function openResource(resource, { push = true, investigate = true, manual 
   if (investigate) resourceRequestVersion = version;
   const summaryId = investigate ? setSummaryState(target, 'loading') : null;
   if (!investigate && summaryStates.get(summaryKey(target))?.phase !== 'failed') setSummaryState(target, 'previous');
+  else if (!investigate) $('resource-scan-details').open = true;
   for (const tab of tabs) $(`panel-${tab}`).hidden = true;
   $('panel-events').hidden = true;
   $('panel-monitoring').hidden = true;
@@ -734,7 +860,7 @@ async function openResource(resource, { push = true, investigate = true, manual 
   $('namespace-controls').hidden = true;
   $('panel-resource').hidden = false;
   $('panel-resource').focus();
-  $('resource-manual-controls').hidden = !manual;
+  $('resource-manual-controls').hidden = false;
   $('resource-refresh').hidden = false;
   $('resource-refresh').disabled = investigate;
   $('ask-resource-question').disabled = investigate;
@@ -742,7 +868,7 @@ async function openResource(resource, { push = true, investigate = true, manual 
   $('resource-question').value = '';
   $('resource-question-status').textContent = '';
   $('resource-cluster').textContent = target.context;
-  $('resource-namespace').textContent = target.kind === 'Node' ? 'Cluster-scoped' : target.namespace;
+  $('resource-namespace').textContent = target.namespace || 'Cluster-scoped';
   $('resource-phase-label').textContent = target.kind === 'CronJob' ? 'Schedule status' : 'State';
   $('resource-phase').textContent = 'Loading…';
   $('resource-pod-summary').hidden = true;
@@ -753,6 +879,10 @@ async function openResource(resource, { push = true, investigate = true, manual 
   $('resource-related').replaceChildren();
   $('resource-scale').hidden = !(target.kind === 'Deployment' && state.editing);
   $('pod-log-section').hidden = target.kind !== 'Pod';
+  $('describe-section').hidden = !investigableKinds.has(target.kind);
+  $('logs-inspector-tab').hidden = target.kind !== 'Pod';
+  document.querySelector('[data-inspector-tab="describe"]').hidden = !investigableKinds.has(target.kind);
+  showInspectorTab('overview');
   $('previous').checked = false;
   $('log-target').textContent = 'Logs can contain sensitive data. Pending containers may not have logs yet.';
   $('logs').textContent = 'Not loaded.';
@@ -814,6 +944,150 @@ async function loadWorkloads() {
   workloadsState = 'ready';
   renderWorkloads(previousSelection);
   renderResourceRelated();
+}
+async function loadResourceTypes() {
+  const context = state.context;
+  const version = ++explorerDiscoveryVersion;
+  explorerVersion++;
+  explorerTypes = [];
+  explorerNames = [];
+  $('explorer-type').disabled = true;
+  setOptions($('explorer-type'), [], '', 'Loading resource types…');
+  explorerStatus = 'Loading resource types…';
+  renderExplorer();
+  try {
+    const types = await api('resource-types');
+    if (context !== state.context || version !== explorerDiscoveryVersion) return;
+    explorerTypes = types;
+    $('explorer-type').replaceChildren(new Option('Select a resource type', ''));
+    for (const type of types) $('explorer-type').add(new Option(`${type.resource} · ${type.namespaced ? 'Namespaced' : 'Cluster-scoped'}`, type.kind));
+    if (types.some(type => type.kind === 'Pod')) $('explorer-type').value = 'Pod';
+    renderKindShortcuts();
+    $('explorer-type').disabled = !types.length;
+    explorerStatus = types.some(type => type.kind === 'Pod')
+      ? 'Pod is selected. Choose a namespace to browse pods.'
+      : types.length ? 'Select a resource type.' : 'No listable resource types were discovered.';
+    renderExplorer();
+  } catch (error) {
+    if (context === state.context && version === explorerDiscoveryVersion) {
+      explorerStatus = 'Resource types could not be loaded. Refresh to try again.';
+      renderExplorer();
+    }
+    throw error;
+  }
+}
+function renderKindShortcuts() {
+  const container = $('resource-kind-shortcuts');
+  container.replaceChildren();
+  for (const kind of commonExplorerKinds) {
+    const type = explorerTypes.find(item => item.kind === kind);
+    if (!type) continue;
+    const button = document.createElement('button');
+    button.className = 'secondary';
+    button.classList.toggle('active', $('explorer-type').value === kind);
+    button.textContent = kind === 'PersistentVolumeClaim' ? 'PVCs' : `${kind}s`;
+    button.addEventListener('click', () => {
+      $('explorer-type').value = kind;
+      renderKindShortcuts();
+      perform(loadExplorerNames);
+    });
+    container.append(button);
+  }
+}
+async function loadExplorerNames() {
+  const type = explorerTypes.find(item => item.kind === $('explorer-type').value);
+  renderKindShortcuts();
+  const context = state.context;
+  const namespace = type?.namespaced ? state.namespace : '';
+  const version = ++explorerVersion;
+  explorerNames = [];
+  if (!type || (type.namespaced && !namespace)) {
+    explorerStatus = type ? 'Select a namespace to browse this resource type.' : 'Select a resource type.';
+    renderExplorer();
+    return;
+  }
+  explorerStatus = 'Loading resources…';
+  renderExplorer();
+  try {
+    const names = await api('resource-names', { context, namespace, kind: type.kind });
+    if (version !== explorerVersion || context !== state.context || (type.namespaced && namespace !== state.namespace)) return;
+    explorerNames = names;
+    explorerStatus = names.length ? `${names.length} ${names.length === 1 ? 'resource' : 'resources'} available.` : 'No resources found.';
+    renderExplorer();
+  } catch (error) {
+    if (version === explorerVersion && context === state.context) {
+      explorerStatus = 'Resources could not be loaded. Check permissions and try again.';
+      renderExplorer();
+    }
+    throw error;
+  }
+}
+function renderExplorer() {
+  const query = $('explorer-filter').value.trim().toLowerCase();
+  const names = explorerNames.filter(name => name.toLowerCase().includes(query));
+  const type = explorerTypes.find(item => item.kind === $('explorer-type').value);
+  const problemNames = new Set(findingGroups().filter(group =>
+    (!state.namespace || group.target.namespace === state.namespace) &&
+    (!type || group.target.kind === type.kind)
+  ).flatMap(group => [...group.resources.values()].map(resource => resource.name)));
+  const visibleNames = explorerProblemsOnly ? names.filter(name => problemNames.has(name)) : names;
+  const select = $('explorer-select');
+  const selected = select.value;
+  setOptions(select, names, selected, 'Select a resource');
+  select.disabled = !names.length;
+  $('explorer-refresh').disabled = !type || (type.namespaced && !state.namespace);
+  $('explorer-filter').disabled = !explorerNames.length;
+  $('explorer-investigate').disabled = !select.value;
+  $('explorer-status').textContent = explorerNames.length && !names.length ? 'No resources match this filter.' : explorerStatus;
+  const grid = $('explorer-resource-grid');
+  grid.replaceChildren();
+  if (!type) {
+    grid.textContent = 'Choose a resource type to browse.';
+    grid.classList.add('empty');
+    return;
+  }
+  grid.classList.toggle('empty', !names.length);
+  if (!visibleNames.length) {
+    grid.textContent = explorerProblemsOnly && names.length ? 'No problem resources match this type and search.' : explorerNames.length ? 'No resources match this search.' : 'No resources are available for this scope.';
+    return;
+  }
+  const count = Math.min(visibleNames.length, 200);
+  for (const name of visibleNames.slice(0, count)) {
+    const button = document.createElement('button');
+    button.className = 'resource-browser-card';
+    if (problemNames.has(name)) button.classList.add('has-problem');
+    const kind = document.createElement('span');
+    kind.className = 'resource-kind';
+    kind.textContent = type.kind;
+    const title = document.createElement('strong');
+    title.textContent = name;
+    const scope = document.createElement('span');
+    scope.className = 'resource-scope';
+    scope.textContent = type.namespaced ? state.namespace : 'Cluster-scoped';
+    const status = workloadsCache.find(item => item.kind === type.kind && item.name === name);
+    if (status?.status) {
+      const badge = document.createElement('span');
+      badge.className = `resource-status-badge status-${String(status.status).toLowerCase().replace(/[^a-z]+/g, '-')}`;
+      badge.textContent = status.status;
+      button.append(kind, badge, title, scope);
+    } else {
+      button.append(kind, title, scope);
+    }
+    const action = document.createElement('span');
+    action.className = 'resource-action';
+    action.textContent = 'Open diagnosis →';
+    button.append(action);
+    button.addEventListener('click', () => perform(() => openResource({
+      kind: type.kind, name, namespace: type.namespaced ? state.namespace : ''
+    }, { manual: true })));
+    grid.append(button);
+  }
+  if (visibleNames.length > count) {
+    const more = document.createElement('p');
+    more.className = 'hint';
+    more.textContent = `${visibleNames.length - count} additional resources are hidden. Refine the search.`;
+    grid.append(more);
+  }
 }
 function workloadKey(item) {
   return JSON.stringify([item.kind, item.name]);
@@ -919,6 +1193,10 @@ function clearTargetData() {
   workloadsVersion++;
   workloadsCache = [];
   workloadsState = 'idle';
+  explorerVersion++;
+  explorerNames = [];
+  explorerStatus = 'Select a resource type.';
+  renderExplorer();
   renderWorkloads('');
   $('events').textContent = 'Choose a namespace to see events.';
   renderNamespaceIssues();
@@ -929,7 +1207,7 @@ async function refreshData() {
   if (failures.length) message(failures.map(x => x.reason.message).join(' | '));
 }
 async function refreshNamespaceData() {
-  const results = await Promise.allSettled([loadWorkloads(), loadEvents()]);
+  const results = await Promise.allSettled([loadWorkloads(), loadEvents(), ...($('explorer-type').value ? [loadExplorerNames()] : [])]);
   const failures = results.filter(result => result.status === 'rejected');
   if (failures.length) message(failures.map(result => result.reason.message).join(' | '));
 }
@@ -969,12 +1247,12 @@ $('context').addEventListener('change', () => perform(async () => {
     showInvestigation();
     $('context').disabled = false;
     investigationVersion++;
-    $('ai-progress').hidden = false;
-    $('ai-spinner').hidden = false;
+    $('ai-progress').hidden = true;
+    $('ai-spinner').hidden = true;
     $('ask-copilot').disabled = true;
     $('ask-copilot').hidden = true;
     clusterCopilotStatus = 'waiting';
-    $('ai-status').textContent = 'Waiting for cluster checks before Copilot reviews grouped findings…';
+    $('ai-status').textContent = '';
     const scan = scanIssues();
     const investigation = scan.then(
       result => result && state.context === context ? requestInvestigation(context, result.issues, result.errors) : undefined,
@@ -983,7 +1261,7 @@ $('context').addEventListener('change', () => perform(async () => {
         : undefined
     );
     const results = await Promise.allSettled([
-      loadNamespaces(), scan, investigation,
+      loadNamespaces(), loadResourceTypes(), scan, investigation,
       ...(state.namespace ? [loadWorkloads(), loadEvents()] : [])
     ]);
     const failures = results.filter(result => result.status === 'rejected');
@@ -1022,6 +1300,27 @@ $('namespace').addEventListener('change', () => perform(async () => {
   }
 }));
 $('refresh').addEventListener('click', () => perform(refreshNamespaceData));
+$('refresh-resource-types').addEventListener('click', () => perform(loadResourceTypes));
+$('explorer-refresh').addEventListener('click', () => perform(loadExplorerNames));
+$('explorer-type').addEventListener('change', () => perform(loadExplorerNames));
+$('explorer-filter').addEventListener('input', renderExplorer);
+$('explorer-select').addEventListener('change', renderExplorer);
+$('explorer-investigate').addEventListener('click', () => perform(async () => {
+  const type = explorerTypes.find(item => item.kind === $('explorer-type').value);
+  const name = $('explorer-select').value;
+  if (!type || !explorerNames.includes(name)) throw new Error('Select an available resource first.');
+  await openResource({ kind: type.kind, name, namespace: type.namespaced ? state.namespace : '' }, { manual: true });
+}));
+$('refresh-namespaced-inventory').addEventListener('click', () => perform(async () => {
+  if ($('explorer-type').value) await loadExplorerNames();
+  if (state.namespace) await loadWorkloads();
+}));
+$('explorer-problems-toggle').addEventListener('click', () => {
+  explorerProblemsOnly = !explorerProblemsOnly;
+  $('explorer-problems-toggle').setAttribute('aria-pressed', String(explorerProblemsOnly));
+  $('explorer-problems-toggle').classList.toggle('active', explorerProblemsOnly);
+  renderExplorer();
+});
 $('scan').addEventListener('click', () => perform(scanIssues));
 $('findings-filter').addEventListener('input', () => { scanLimit = 100; renderScanIssues(); });
 $('show-more-issues').addEventListener('click', () => { scanLimit += 100; renderScanIssues(); });
@@ -1032,10 +1331,13 @@ async function requestInvestigation(context, findings = scanCache, errors = scan
   copilotReviewCount = groupedFindings.length;
   $('ai-progress').hidden = false;
   $('ai-spinner').hidden = false;
+  if (!errors.length && $('scan-spinner').hidden && $('scan-result-icon').textContent === '✓') {
+    $('scan-progress').hidden = true;
+  }
   $('ask-copilot').hidden = true;
   $('ask-copilot').disabled = true;
   const coverage = groupedFindings.length > 100 ? ` Reviewing the first 100 of ${groupedFindings.length} grouped findings.` : '';
-  $('ai-status').textContent = `Copilot is reviewing the scan evidence…${coverage} Check chat for any tool approval requests.`;
+  $('ai-status').textContent = `Copilot is enriching the findings…${coverage}`;
   try {
     const signals = groupedFindings.slice(0, 100).map(group => {
       const evidence = [`${group.signals.length} signals across ${group.resources.size} related resources.`];
@@ -1059,6 +1361,9 @@ async function requestInvestigation(context, findings = scanCache, errors = scan
     });
     await api('ask-copilot', { context, findings: signals, scanErrors: errors.slice(0, 20).map(error => error.slice(0, 500)) });
     if (state.context === context && version === investigationVersion) {
+      const nextState = await api('state');
+      if (state.context !== context || version !== investigationVersion) return;
+      renderState(nextState);
       clusterCopilotStatus = 'complete';
       renderOverviewCopilotStatus();
     }
@@ -1067,12 +1372,13 @@ async function requestInvestigation(context, findings = scanCache, errors = scan
       const timedOut = /timeout|timed out/i.test(error.message);
       clusterCopilotStatus = timedOut ? 'uncertain' : 'error';
       $('ai-status').textContent = timedOut
-        ? 'Copilot did not finish in time. It may still be working; check the chat.'
+        ? 'Copilot did not finish in time. The review may still be running.'
         : `Copilot investigation could not be completed: ${error.message}`;
     }
   } finally {
     if (version === investigationVersion) {
       $('ai-spinner').hidden = true;
+      $('scan-progress').hidden = false;
       $('ask-copilot').disabled = false;
       $('ask-copilot').hidden = false;
       renderResourceIssues();
@@ -1096,7 +1402,6 @@ async function askManualQuestion(resource = false) {
     return;
   }
   const version = resourceVersion;
-  const summaryId = resource ? setSummaryState(target, 'loading') : null;
   button.disabled = true;
   if (resource) {
     resourceRequestVersion = version;
@@ -1107,19 +1412,14 @@ async function askManualQuestion(resource = false) {
   try {
     await api('ask-manual-copilot', { ...target, question });
     if (state.context === target.context && (!resource || version === resourceVersion)) {
-      if (resource) {
-        const nextState = await api('state');
-        if (state.context !== target.context || version !== resourceVersion) return;
-        setSummaryState(target, 'complete', summaryId);
-        renderState(nextState);
-        if ((nextState.resourceSummaries || []).some(item => sameTarget(item, target))) hideResourceCopilotStatus();
-        else showResourceCopilotStatus('No Copilot summary was returned for this resource.');
-      }
+      const nextState = await api('state');
+      if (state.context !== target.context || (resource && version !== resourceVersion)) return;
+      renderState(nextState);
+      if (resource) hideResourceCopilotStatus();
       input.value = '';
-      status.textContent = resource ? '' : 'Sent to Copilot. Check chat for the response and tool approvals.';
+      status.textContent = '';
     }
   } catch (error) {
-    if (resource) setSummaryState(target, 'failed', summaryId);
     if (state.context === target.context && (!resource || version === resourceVersion)) status.textContent = `Could not send to Copilot: ${error.message}`;
     if (resource && version === resourceVersion) showResourceCopilotStatus('The latest Copilot question could not be completed.');
   } finally {
@@ -1129,10 +1429,26 @@ async function askManualQuestion(resource = false) {
         $('resource-refresh').disabled = false;
         $('resource-ai-spinner').hidden = true;
       }
-    } else if (resource && summaryStates.get(summaryKey(target))?.phase === 'loading') {
-      setSummaryState(target, 'previous', summaryId);
     }
     if (resource && resourceRequestVersion === version) resourceRequestVersion = 0;
+  }
+}
+function renderConversation(id, target) {
+  const container = $(id);
+  container.replaceChildren();
+  const conversation = (state.conversations || []).find(item => item.context === state.context &&
+    item.kind === (target?.kind || '') && item.name === (target?.name || '') &&
+    item.namespace === (target?.namespace || ''));
+  for (const message of conversation?.messages || []) {
+    const article = document.createElement('article');
+    article.className = `conversation-message ${message.role}`;
+    const heading = document.createElement('strong');
+    heading.textContent = message.role === 'user' ? 'You' : 'Copilot';
+    const content = document.createElement('div');
+    if (message.role === 'assistant') renderSummary(content, message.content);
+    else content.textContent = message.content;
+    article.append(heading, content);
+    container.append(article);
   }
 }
 $('ask-cluster-question').addEventListener('click', () => askManualQuestion());

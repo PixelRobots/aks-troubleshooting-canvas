@@ -25,7 +25,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
     return node;
   }
   const textOf = node => node.textContent + node.children.map(textOf).join('');
-  const backend = { context: '', namespace: '', aiIssues: [], resourceSummaries: [], editing: false };
+  const backend = { context: '', namespace: '', aiIssues: [], resourceSummaries: [], conversations: [], editing: false };
   const investigations = [];
   const investigationRequests = [];
   const resourceInvestigations = [];
@@ -43,6 +43,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
   let failWorkloads = false;
   let failResourceRead = false;
   let partialScan = false;
+  let laterInvestigation;
   let groupedScan = false;
   let groupedSetKind = '';
   let longGroupedScan = false;
@@ -54,6 +55,12 @@ test('cluster picker opens the investigation and switching clusters resets editi
     if (route === 'state' || route === 'select-context' || route === 'select-namespace' || route === 'editing') return { ...backend };
     if (route === 'contexts') return ['east', 'west'];
     if (route === 'namespaces') return ['shop'];
+    if (route === 'resource-types') return [
+      { resource: 'pods', kind: 'Pod', namespaced: true },
+      { resource: 'widgets.example.io', kind: 'widgets.example.io', namespaced: true },
+      { resource: 'clusterwidgets.example.io', kind: 'clusterwidgets.example.io', namespaced: false }
+    ];
+    if (route === 'resource-names') return body.kind === 'Pod' ? ['checkout-123'] : ['sample'];
     if (route === 'workloads') return [
       { kind: 'Deployment', name: 'checkout', status: '1/1 ready' },
       { kind: 'Pod', name: 'checkout-123', status: 'Running', restarts: 0 }
@@ -129,7 +136,9 @@ test('cluster picker opens the investigation and switching clusters resets editi
     groupFindings,
     document: {
       getElementById: element,
-      querySelector: () => ({ content: 'token' }),
+      querySelector: selector => selector.includes('meta[name=')
+        ? { content: 'token' }
+        : element(selector.replace(/^\[data-inspector-(?:tab|panel)="([^"]+)"\]$/, 'inspector-$1')),
       createElement: tag => element('', tag)
     },
     Option: function (text, value) { this.text = text; this.value = value; },
@@ -145,6 +154,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
           backend.editing = false;
           backend.aiIssues = [];
           backend.resourceSummaries = [];
+          backend.conversations = [];
         }
         backend.context = body.context;
       }
@@ -164,12 +174,12 @@ test('cluster picker opens the investigation and switching clusters resets editi
       }
       if (route === 'ask-manual-copilot') {
         manualInvestigations.push(body);
-        if (body.kind) {
-          if (resourceQuestionDelay) await resourceQuestionDelay;
-          backend.resourceSummaries = backend.resourceSummaries.filter(item =>
-            item.kind !== body.kind || item.name !== body.name || item.namespace !== body.namespace);
-          backend.resourceSummaries.push({ kind: body.kind, name: body.name, namespace: body.namespace, summary: 'Full answer to the resource question' });
-        }
+        if (body.kind && resourceQuestionDelay) await resourceQuestionDelay;
+        const conversation = { context: body.context, kind: body.kind || '', name: body.name || '', namespace: body.namespace || '',
+          messages: [{ role: 'user', content: body.question }, { role: 'assistant', content: 'Full answer to the question' }] };
+        backend.conversations = backend.conversations.filter(item =>
+          item.context !== conversation.context || item.kind !== conversation.kind || item.name !== conversation.name || item.namespace !== conversation.namespace);
+        backend.conversations.push(conversation);
       }
       if (route === 'scan') scans++;
       if (route === 'scan' && delayFirstScan) {
@@ -180,6 +190,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
         delayFirstInvestigation = false;
         await firstInvestigation;
       }
+      if (route === 'ask-copilot' && laterInvestigation) await laterInvestigation;
       if (route === 'ask-copilot' && failInvestigation) {
         return { ok: false, json: async () => ({ error: 'Timeout waiting for response' }) };
       }
@@ -204,14 +215,15 @@ test('cluster picker opens the investigation and switching clusters resets editi
   const selecting = element('context').change();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(element('scan-spinner').hidden, false);
-  assert.equal(element('scan-result-icon').hidden, true);
+  assert.equal(element('scan-result-icon').hidden, true, element('status').textContent);
   assert.equal(element('overview-title').textContent, 'Checking cluster…');
   assert.equal(element('scan').hidden, true);
   assert.match(element('scan-status').textContent, /Scanning/);
+  assert.equal(element('scan-progress').hidden, false);
   assert.equal(element('scan').disabled, true);
-  assert.equal(element('ai-spinner').hidden, false);
+  assert.equal(element('ai-progress').hidden, true);
+  assert.equal(element('ai-spinner').hidden, true);
   assert.equal(element('ask-copilot').hidden, true);
-  assert.match(element('ai-status').textContent, /Waiting for cluster checks/);
   assert.equal(element('ask-copilot').disabled, true);
   releaseScan();
   await new Promise(resolve => setImmediate(resolve));
@@ -221,8 +233,10 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.match(element('scan-result-icon').className, /success/);
   assert.equal(element('overview-title').textContent, 'Findings');
   assert.equal(element('scan').hidden, false);
+  assert.equal(element('scan-progress').hidden, true);
+  assert.equal(element('ai-progress').hidden, false);
   assert.equal(element('ai-spinner').hidden, false);
-  assert.match(element('ai-status').textContent, /reviewing the scan evidence/);
+  assert.match(element('ai-status').textContent, /enriching the findings/);
   assert.match(element('ai-status').textContent, /first 100 of 130 grouped findings/);
   assert.equal(investigationRequests[0].findings.length, 100);
   assert.equal(investigationRequests[0].findings[0].name, 'checkout-123');
@@ -233,19 +247,21 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(pendingIssue.children[5].children.length, 1);
   assert.equal(pendingIssue.children[5].children[0].textContent, 'Investigate resource');
   await pendingIssue.children[5].children[0].click();
-  assert.equal(textOf(element('resource-summary')), 'Full Copilot summary for checkout-123');
+  assert.equal(textOf(element('resource-summary')), 'Full Copilot summary for checkout-123', element('status').textContent);
+  assert.equal(element('resource-scan-details').open, false);
   const resourceFinding = element('resource-scan-issues').children[0];
   assert.equal(resourceFinding.children[1].textContent, 'Evidence: Evidence');
   assert.equal(resourceFinding.children[2].textContent, 'Next step: Inspect');
   assert.equal(element('resource-scan-issues').children[1].children[0].href, 'https://kubernetes.io/docs/');
   assert.equal(element('resource-ai-progress').hidden, true);
   assert.equal(element('resource-ai-spinner').hidden, true);
-  assert.equal(element('resource-manual-controls').hidden, true);
+  assert.equal(element('resource-manual-controls').hidden, false);
   assert.equal(element('resource-refresh').hidden, false);
   assert.equal(resourceInvestigations.length, 1);
   releaseInvestigation();
   await selecting;
   assert.equal(element('ai-spinner').hidden, true);
+  assert.equal(element('scan-progress').hidden, false);
   assert.equal(element('ask-copilot').hidden, false);
   assert.equal(element('ai-progress').hidden, false);
   assert.match(element('ai-status').textContent, /first 100 of 130 grouped findings/);
@@ -253,8 +269,10 @@ test('cluster picker opens the investigation and switching clusters resets editi
     title: 'Copilot-improved finding', evidence: 'Copilot evidence', next: 'Review the recovery path',
     docs: [], kind: 'Pod', name: 'checkout-123', namespace: 'shop'
   }];
+  element('resource-scan-details').open = true;
   pollState();
   await new Promise(resolve => setImmediate(resolve));
+  assert.equal(element('resource-scan-details').open, true);
   assert.equal(element('ai-progress').hidden, false);
   assert.match(element('ai-status').textContent, /first 100 of 130 grouped findings/);
   const published = element('resource-issues').children[0];
@@ -269,7 +287,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
   await element('ask-copilot').click();
   assert.equal(element('ai-spinner').hidden, true);
   assert.equal(element('ai-progress').hidden, false);
-  assert.match(element('ai-status').textContent, /may still be working/);
+  assert.match(element('ai-status').textContent, /may still be running/);
   failInvestigation = false;
   assert.equal(element('cluster-picker').hidden, true);
   assert.equal(element('investigation').hidden, false);
@@ -294,7 +312,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
   await nodeIssue.children[4].children[0].click();
   assert.equal(element('resource-title').textContent, 'Node / pod-129');
   assert.equal(element('resource-namespace').textContent, 'Cluster-scoped');
-  assert.equal(element('resource-manual-controls').hidden, true);
+  assert.equal(element('resource-manual-controls').hidden, false);
   assert.equal(resourceInvestigations.length, 2);
   await element('resource-back').click();
   element('findings-filter').value = 'CHECKOUT';
@@ -320,11 +338,29 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(element('issues').children[0].children[1].textContent, 'Sources: Copilot');
   assert.equal(element('scan-result-icon').textContent, '!');
   assert.match(element('scan-status').textContent, /Scan unavailable/);
+  let releaseLaterInvestigation;
+  laterInvestigation = new Promise(resolve => { releaseLaterInvestigation = resolve; });
+  const failedScanReview = element('ask-copilot').click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(element('scan-progress').hidden, false);
+  assert.match(element('scan-status').textContent, /Scan unavailable/);
+  releaseLaterInvestigation();
+  await failedScanReview;
+  laterInvestigation = null;
   failScan = false;
   partialScan = true;
   await element('scan').click();
   assert.equal(element('scan-result-icon').textContent, '!');
   assert.match(element('scan-status').textContent, /incomplete.*Forbidden/);
+  laterInvestigation = new Promise(resolve => { releaseLaterInvestigation = resolve; });
+  const partialReview = element('ask-copilot').click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(element('scan-progress').hidden, false);
+  assert.equal(element('ai-progress').hidden, false);
+  assert.match(element('scan-status').textContent, /incomplete.*Forbidden/);
+  releaseLaterInvestigation();
+  await partialReview;
+  laterInvestigation = null;
   partialScan = false;
   await element('scan').click();
   element('tab-workloads').click();
@@ -337,12 +373,31 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.equal(element('investigate-workload').disabled, true);
   assert.equal(element('panel-events').hidden, false);
   assert.equal(element('panel-monitoring').hidden, false);
+  element('explorer-type').value = 'clusterwidgets.example.io';
+  await element('explorer-type').change();
+  assert.match(element('explorer-status').textContent, /1 resource available/);
+  assert.equal(element('explorer-resource-grid').children.length, 1);
+  assert.equal(textOf(element('explorer-resource-grid').children[0]), 'clusterwidgets.example.iosampleCluster-scopedOpen diagnosis →');
+  assert.equal(element('resource-kind-shortcuts').children.length, 1);
+  element('explorer-filter').value = 'missing';
+  element('explorer-filter').input();
+  assert.match(element('explorer-status').textContent, /No resources match/);
+  element('explorer-filter').value = '';
+  element('explorer-filter').input();
+  element('explorer-select').value = 'sample';
+  element('explorer-select').change();
+  await element('explorer-investigate').click();
+  assert.equal(element('resource-namespace').textContent, 'Cluster-scoped');
+  assert.equal(element('describe-section').hidden, true);
+  assert.equal(resourceInvestigations.at(-1).kind, 'clusterwidgets.example.io');
+  assert.equal(resourceInvestigations.at(-1).namespace, '');
+  await element('resource-back').click();
   await element('ask-cluster-question').click();
   assert.match(element('cluster-question-status').textContent, /Enter a question/);
   element('cluster-question').value = 'Why are pods pending?';
   await element('ask-cluster-question').click();
   assert.deepEqual(manualInvestigations[0], { context: 'east', question: 'Why are pods pending?' });
-  assert.match(element('cluster-question-status').textContent, /Sent to Copilot/);
+  assert.match(textOf(element('cluster-conversation')), /Why are pods pending.*Full answer to the question/);
 
   backend.aiIssues = [{ title: 'Copilot signal', evidence: 'Observed', next: 'Review', docs: [], kind: 'Pod', name: 'other', namespace: 'shop' }];
   const scansBeforeNamespaceSelection = scans;
@@ -362,7 +417,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
   pollState();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(element('namespace-issues').children[1], existingCard);
-  assert.deepEqual(investigations, ['east', 'east']);
+  assert.deepEqual(investigations, ['east', 'east', 'east', 'east']);
   assert.equal(element('workloads').children.length, 2);
   assert.equal(element('workload-select').disabled, false);
   assert.equal(element('workload-select').children.length, 3);
@@ -403,7 +458,8 @@ test('cluster picker opens the investigation and switching clusters resets editi
   resourceQuestionDelay = new Promise(resolve => { releaseQuestion = resolve; });
   const asking = element('ask-resource-question').click();
   await new Promise(resolve => setImmediate(resolve));
-  assert.match(element('resource-summary-age').textContent, /Previous summary.*updating/);
+  assert.equal(element('resource-summary-age').hidden, true);
+  assert.equal(element('resource-scan-details').open, false);
   assert.equal(element('resource-refresh').disabled, true);
   assert.equal(element('resource-ai-spinner').hidden, false);
   assert.equal(element('resource-ai-progress').hidden, false);
@@ -413,14 +469,16 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.deepEqual(manualInvestigations[1], { context: 'east', namespace: 'shop', kind: 'Pod', name: 'checkout-123', question: 'Why is this pod pending?' });
   assert.equal(element('resource-question-status').textContent, '');
   assert.equal(element('resource-ai-progress').hidden, true);
-  assert.equal(textOf(element('resource-summary')), 'Full answer to the resource question');
+  assert.match(textOf(element('resource-conversation')), /Why is this pod pending.*Full answer to the question/);
+  assert.equal(element('resource-scan-details').open, false);
   let releaseResource;
   resourceDelay = new Promise(resolve => { releaseResource = resolve; });
-  customResourceSummary = '## Observations\n**Pending** pod; see [guide](https://kubernetes.io/docs/).\n\n## Next steps\n1. Check `kubectl`.\n2. Review [unsafe](javascript:alert).\n\n<img src=x onerror=alert(1)>';
+  customResourceSummary = '## Observations\n**Pending** pod; see [guide](https://kubernetes.io/docs/).\n\n## Next steps\n1. Check `kubectl`.\n2. Review [unsafe](javascript:alert).\n\n<img src=x onerror=alert(1)>\n\nSUGGESTIONS: Show the SecretProviderClass | Show recent events for this pod';
   const refreshing = element('resource-refresh').click();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(element('resource-summary-age').hidden, false);
   assert.match(element('resource-summary-age').textContent, /Previous summary.*updating/);
+  assert.equal(element('resource-scan-details').open, true);
   assert.equal(element('resource-ai-progress').hidden, false);
   assert.equal(element('resource-refresh').disabled, true);
   assert.equal(element('ask-resource-question').disabled, true);
@@ -440,18 +498,24 @@ test('cluster picker opens the investigation and switching clusters resets editi
   assert.doesNotMatch(JSON.stringify(summaryNodes[3]), /"tagName":"A"/);
   assert.match(textOf(summaryNodes[4]), /<img src=x onerror=alert\(1\)>/);
   assert.doesNotMatch(JSON.stringify(summaryNodes[4]), /"tagName":"IMG"/);
+  assert.equal(summaryNodes[5].className, 'suggestions');
+  assert.equal(textOf(summaryNodes[5].children[1]), 'Show the SecretProviderClass');
+  await summaryNodes[5].children[1].click();
+  assert.equal(manualInvestigations.at(-1).question, 'Show the SecretProviderClass');
   assert.equal(element('resource-summary-age').hidden, true);
   assert.equal(element('resource-ai-progress').hidden, true);
+  assert.equal(element('resource-scan-details').open, false);
   failResource = true;
   await element('resource-refresh').click();
   assert.equal(element('resource-summary-age').hidden, false);
   assert.match(element('resource-summary-age').textContent, /latest investigation failed/);
   assert.match(element('resource-ai-status').textContent, /Investigation unavailable/);
   assert.equal(element('resource-ai-progress').hidden, false);
+  assert.equal(element('resource-scan-details').open, true);
   assert.equal(textOf(element('resource-summary').children[0]), 'Observations');
   failResource = false;
   customResourceSummary = null;
-  assert.equal(resourceInvestigations.length, 5);
+  assert.equal(resourceInvestigations.length, 6);
   await element('resource-back').click();
   assert.equal(element('panel-workloads').hidden, false);
   assert.equal(element('namespace-controls').hidden, false);
@@ -467,6 +531,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
   const investigationsBeforeBrowse = resourceInvestigations.length;
   await element('workloads').children[0].children[1].click();
   assert.equal(element('resource-manual-controls').hidden, false);
+  element('resource-scan-details').open = false;
   assert.equal(resourceInvestigations.length, investigationsBeforeBrowse + 1);
   await element('resource-back').click();
   await element('refresh').click();
@@ -515,11 +580,12 @@ test('cluster picker opens the investigation and switching clusters resets editi
   }];
   pollState();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(element('ai-progress').hidden, true);
+  assert.equal(element('ai-progress').hidden, false);
+  assert.match(element('ai-status').textContent, /AI summary review complete/);
   failInvestigation = true;
   await element('ask-copilot').click();
   assert.equal(element('ai-progress').hidden, false);
-  assert.match(element('ai-status').textContent, /may still be working/);
+  assert.match(element('ai-status').textContent, /may still be running/);
   failInvestigation = false;
   const requestsBeforeGrouped = resourceInvestigations.length;
   await element('issues').children[0].children[5].children[0].click();
@@ -577,7 +643,8 @@ test('cluster picker opens the investigation and switching clusters resets editi
   await element('resource-scan-issues').children[2].children[3].click();
   assert.equal(element('resource-title').textContent, 'Pod / backup-d');
   assert.equal(element('resource-related').children.length, 0);
-  assert.equal(element('resource-related').textContent, 'No supported related resources found.');
+  assert.equal(element('resource-related').textContent, 'No related resources needed investigation.');
+  assert.equal(element('inspector-related').hidden, true);
   failResourceRead = true;
   await element('resource-refresh').click();
   assert.match(element('resource-status').textContent, /Resource could not be loaded: Resource forbidden/);
@@ -624,7 +691,7 @@ test('cluster picker opens the investigation and switching clusters resets editi
 
   element('context').value = 'west';
   await element('context').change();
-  assert.deepEqual(investigations, ['east', 'east', 'east', 'east', 'east', 'west']);
+  assert.deepEqual(investigations, ['east', 'east', 'east', 'east', 'east', 'east', 'east', 'west']);
   assert.equal(element('cluster-title').textContent, 'west');
   assert.equal(backend.namespace, '');
   assert.equal(element('investigation').hidden, false);
